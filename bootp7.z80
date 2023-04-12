@@ -1,0 +1,126 @@
+    TITLE Pasopia-7 CP/M v2.2  IPL code
+
+    .z80
+    ASEG
+
+BIOSENT     equ 0005h
+CCPTOP      equ 0d400h
+CBIOSTOP    equ 0ea00h
+
+    org 00100h
+
+LOADERSIZE  equ 0100h
+LOADERTOP   equ 8000h
+LOADERFROM  equ 0d000h
+
+LOADERENT   equ 8020h
+
+    DI
+    LD BC, LOADERSIZE     ;; Loader length
+    LD DE, LOADERTOP     ;;
+    LD HL, LOADERFROM
+    LDIR
+
+    JP LOADERENT
+
+    org 00120h
+    .phase LOADERENT
+
+    ;; load CCP & BDOS
+    call LOADER
+
+    ;; load BIOS
+    ld hl, 0101h
+    ld (STARTSEC), hl
+    ld hl, 010Dh
+    ld (ENDSEC), hl
+    ld hl, CBIOSTOP
+    ld (READADDR), hl
+    call LOADER
+
+    JP CBIOSTOP
+
+
+LOADER:
+    ld de, (STARTSEC)
+
+LOOP:
+    ld a,(ENDSEC+1)  ;; end track
+    cp d
+    jr z, FINALTRK
+    ;; full track read
+    ld c, 16
+    jr J2
+
+FINALTRK:
+    ;; partial read
+    ld a, (ENDSEC)
+    ld c, a
+
+J2:
+    ;; calc num sectors
+    ;; e: sector# read from (1-base)
+    ;; c: sector# to
+    inc c
+    ld a, c
+    sub e
+    ld b, a
+    ;; HL = B * 256 (=num bytes to read)
+    ld l, 0
+    ld h, b
+    push hl
+    ld hl, (READADDR)
+    ld b, a  ;; b = num-sectors
+    ;; d: track#
+    ld a, d
+    PUSH AF
+
+    ;; a .. logical track# (0-80 track)
+    ;; e .. sector read from (1-base)
+    ;; b .. num sectors to read
+    ;; hl .. address to write
+    LD C, 00
+    SRL A
+    RR C
+    LD D, A
+    ;LD E, 01
+    LD A, C
+    LD C, 12h
+    PUSH HL
+    ;HL Buffer
+    ;D  Track
+    ;E  Sector
+    ;B  Num Sector
+    ;A  0x80: side	
+    CALL BIOSENT
+    LD C, 13h
+    CALL BIOSENT
+    POP HL
+
+    ;; check end of track
+    ld a, (ENDSEC+1)
+    ld b, a
+    POP AF
+    pop de
+    CP b
+    ret z
+
+    add hl, de
+    ld (READADDR), hl
+
+    ;; next track
+    INC A
+    ld d, a
+    ld e, 1     ;; read from 1sector
+    ;; d : track#
+    ;; e : sector# read from
+
+    jr LOOP
+
+STARTSEC: dw  0203h   ;;(track:sector)
+ENDSEC:   dw  0308h   
+READADDR: dw  CCPTOP
+
+    .dephase
+
+    END

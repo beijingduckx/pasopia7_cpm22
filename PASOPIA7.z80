@@ -1,0 +1,1318 @@
+	TITLE	Pasopia7 CP/M BIOS
+	.Z80
+	ASEG
+
+;; Constants
+MSIZE	EQU 60     ; 60k CPM
+BIAS	EQU (MSIZE-20)*1024
+BDOS	EQU	BIAS + 3c00h
+CCP		EQU	BIAS + 3400h
+
+BDOS_ENT EQU BDOS + 6
+;
+WSTART  EQU	0000H
+IOBYTE	EQU	0003H
+CDISK	EQU	0004H
+BDOSJMP	EQU	0005H
+
+
+INT_STACK	EQU	0F800H
+MAIN_STACK  EQU 0f700h
+MAXDISK	 equ  1    ;; Max disk number (i.e. B drive)
+
+
+CPMSTARTSEC equ 0203h   ;;(track:sector)
+CPMENDSEC   equ 0308h   
+
+STARTSEC  equ DEBBUF
+ENDSEC 	equ DEBBUF + 2
+READADDR equ DEBBUF + 4
+
+
+
+
+	org 0100h
+	.PHASE	4A00h + BIAS
+
+;BIOS JP TABLE
+BIOSST:	JP	BOOT
+WBOOTE:
+	JP	WBOOT	
+	JP	CONST	
+	JP	CONIN	
+	JP	CONOUT	
+	JP	LIST	
+	JP	PUNCH	
+	JP	READER	
+	JP	HOME	
+	JP	SELDSK	
+	JP	SETTRK	
+	JP	SETSEC	
+	JP	SETDMA	
+	JP	READ	
+	JP	WRITE	
+	JP	LISTST	
+	JP	SECTRA	
+
+
+;; INTVECTOR
+IVCTC0	equ 0fef0h
+IVCTC1	equ 0fef2h
+IVCTC2	equ 0fef4h
+IVCTC3	equ 0FEF6h
+IVPIOA	equ 0fef8h
+IVPIOB	equ 0fefah
+IVEXT	equ 0feffh
+
+;; Int handler patch address
+INTPADD	equ 0ff47h
+;; CTC3 BIOS entry address
+CTC3_ENTRY equ 4319h
+;; INT BIOS entry address
+INT_BIOS_ENTRY equ 4005h
+
+
+;;
+;; BIOS Functions
+;;
+BFN_INKEY  equ 2
+BFN_CURON  equ 5
+BFN_FDPARAM equ 18
+BFN_FDREAD  equ 19
+BFN_FDWRITE equ 20
+BFN_WIDTH  equ 35
+BFN_SCREEN equ 36
+BFN_CONSOLE equ 38
+BFN_TACCP equ 42
+BFN_TDISPP equ 44
+BFN_SCROLL equ 46
+BFN_PUTC   equ 47
+BFN_PUTS   equ 48
+BFN_CLS    equ 50
+BFN_LOCATE equ 52
+BFN_CURPOS equ 53
+
+
+;; Normal BIOS entry (formally, this should be 4006h)
+BIOS_ENTRY equ 41f9h
+;**********************
+;JP TABLE1
+;BOOT:
+;**********************
+BOOT:
+	DI
+	;; dummy stack for BOOT init.
+	LD	sp, CCP	
+	;; Init stack pointers
+	ld hl, MAIN_STACK
+	LD (BIOSSP), hl
+	LD	hl, INT_STACK
+	LD (INTSP), hl
+	;; int handler patch
+	;;  - JP JPBIOS
+	ld a, 0c3h
+	ld (INTPADD), a
+	ld hl, JPBIOS
+	ld (INTPADD+1), hl
+	;;
+	ld a, 41h		;; LIST .. CRT, CON .. CRT
+	ld (IOBYTE), a
+	call INTSCN
+	di
+	;; Patch CTC3 interrupt
+	;; - for CONOUT buffer
+	ld hl, INT_CTC3
+	ld (IVCTC3), hl
+
+	JP	GOCPM2
+
+INTSCN:
+	;; width 80
+	ld c, BFN_WIDTH
+	ld b, 80
+	call CBIOS
+	;; text mode (screen 0)
+	ld c, BFN_SCREEN
+	ld b, 0
+	call CBIOS
+	;; disp/access text page 0
+	ld b, 0
+	ld c, BFN_TACCP
+	call CBIOS
+	ld b, 0
+	ld c, BFN_TDISPP
+	call CBIOS
+	;; scroll area (1~24line)
+	ld d, 0
+	ld e, 24
+	ld c, BFN_CONSOLE
+	call CBIOS
+	;; set small cursor
+	ld c, BFN_CURON
+	call CBIOS
+	ret
+
+
+;********************
+;JP TABLE2
+;WBOOT:
+;********************
+WBOOT:	
+	di
+	;; Dummy stack for boot
+	LD	SP,CCP
+	call LOADCPM
+GOCPM:
+	xor a
+	ld (CONLEN), a
+GOCPM2:
+	ld a, SP_CPM
+	ld (SPSTAT), a
+	;; reset deblocking
+	call RST_HOST_DISK
+	;;  Page zero settings
+	ld	hl, WBOOTE
+	ld	a, 0c3h
+	ld	(WSTART), a
+	ld	(WSTART + 1), hl
+	ld	hl, BDOS_ENT
+	ld	(BDOSJMP), a
+	ld	(BDOSJMP + 1), hl
+	;; set DMA
+	ld b, 80h  ; default DMA adddress is 80h
+	call SETDMA
+	;; load current disk (for CCP)
+	ld	a, (CDISK)
+	ld	c, a
+	ei
+	jp	CCP		;CCP Start adr.
+
+
+;*****************
+;JP TABLE3
+;CONST:
+;*****************
+CONST:
+	;; check pending key
+	ld a, (LASTCN)
+	or a
+	jr nz, CONST3
+	;; no pending key .. get new one
+	ld c, BFN_INKEY
+	call CBIOS
+	jr c, CONST2   ;; no input
+	call CONIN_SCAN
+	ld (LASTCN), a
+CONST3:
+	ld a, 0ffh
+	ret
+CONST2:
+	xor a
+	ld (LASTCN), a
+	ret
+;
+;
+;************************
+;JP TABLE4
+;CONIN:
+;************************
+CONIN:
+	ld a, (LASTCN)
+	ld c, a
+	xor a
+	ld (LASTCN), a
+	ld a, c
+	or a
+	ret nz
+CONIN2:	
+	ld c, BFN_INKEY
+	call CBIOS
+	jr nc, CONIN_SCAN
+	jr CONIN2
+
+CONIN_SCAN:
+	cp 19		;; ESC or Ctrl-S
+	ld c, a
+	jr nz, CONIN3
+	;; ESC-key check
+	di
+	ld a, 18h
+	out (30h), a   ;; activate KS4 line
+	nop				;; Wait for KS line ready
+	nop				;; (not presicely examined)
+	in a,(31h)		;; read keymatrix
+	and 08h			;; Check 'ESC'
+	jr nz, CONIN3
+	ld c, 27		;; ESC code
+	ei
+
+CONIN3:
+	ld a, c
+	ret
+;
+;
+;********************
+;JP TABLE5
+;CONOUT:
+;********************
+CONOUT:
+	ld a,(ESCNUM)
+	cp 0
+	jr nz, COUT_ESC
+	ld a, c
+	cp 32
+	jp nc, CON_STORE
+	call CON_STROUT
+
+	;; Control characters
+	cp 0dh
+	jr z, COUT_CR
+	cp 0ah
+	jr z, COUT_LF
+	cp 27		; ESC
+	jr z, COUT_ESC
+	cp 08h		; BS
+	jr z,COUT_BS
+	cp 1ah		; Clear screen: Televideo TS803 (for rogue..)
+	jp z,COUT_CLS
+	cp 0ch
+	jp z, COUT_CLS
+	cp 0bh
+	jr z, COUT_HOME
+	ret
+
+COUT_CR:
+	xor a
+	ld (CURX), a
+	jp SETCURSOR
+
+COUT_LF:
+	di
+	xor a
+	ld (CURX), a
+	ld a, (CURY)
+	inc a
+	cp 24
+	jr c, COUT_LF2
+	ld c, 1   ;; 
+	ld (CPMSP), sp
+	ld sp, (BIOSSP)
+	call SCR_SCROLL
+	ld sp, (CPMSP)
+	ret
+
+COUT_LF2:
+	ld (CURY), a
+	ei
+	ret
+
+	;; Backspace	
+COUT_BS:
+	di
+	ld a, (CURX)
+	dec a
+	jr nc, COUT_BS2
+	xor a
+COUT_BS2:
+	ld (CURX), a
+	ei
+	jp SETCURSOR
+
+COUT_HOME:
+	di
+	xor a
+	ld (CURX), a
+	ld (CURY), a
+	ei
+	jp SETCURSOR
+
+	;; Escape squence
+COUT_ESC:
+	ld a,(ESCNUM)
+	cp 0
+	jr nz, COU1
+	;; first
+	ld a,1
+COUTE1:
+	ld (ESCNUM),a
+	ret
+
+	;; Reset ESC
+COUTE_QUIT:
+	xor a
+	jr COUTE1
+
+	;; Esc level 1
+COU1:
+	cp 1
+	jp nz, COU2  ;; to level2
+	;; 
+	ld a, c
+	cp '('   ; REV
+	jr nz, COU11
+
+	;; Reverse
+	ld a, (ATTRIB)
+	or 08h
+	ld (ATTRIB), a
+	jr COUTE_QUIT
+
+COU11:
+	cp ')'   ;  Normal
+	jr nz, COU13
+
+	;; Non-reverse
+	ld a, (ATTRIB)
+	and 07h
+	ld (ATTRIB), a
+	jr COUTE_QUIT
+
+COU13:
+	cp '='   ; Cursor Y X
+	jr nz, COU14
+
+	;; Cursor mode
+	ld a, 2
+	ld (ESCNUM), a
+	ret
+COU14:
+	cp '*'   ; Clear
+	jr nz, COU16
+	;; Clear screen
+COUT_CLS:
+	ld c, BFN_CLS
+	ld b, 1
+	call CBIOS
+	di
+	xor a
+	ld (CURX), a
+	ld (CURY), a
+	ei
+	jr COUTE_QUIT
+
+COU16:
+	cp 'T'   ; clear line (from current cursor)
+	jr nz, COU17
+	ld a, (CURX)
+	ld c, a
+	ld a, 80
+	sub c
+	ld c, a
+	di
+	call CLEARSTRING
+	ei
+	jr COUTE_QUIT
+
+COU17:
+	cp 'R'  ; remove line (scroll up)
+	jr nz, COU18
+	;; set cursor x=79, y=0
+	ld d, 79
+	ld e, 0
+	ld c, BFN_LOCATE
+	call CBIOS
+	ld a, (CURY)
+	ld d, a
+	ld e, 23
+	ld b, 0
+	ld c, BFN_SCROLL
+	call CBIOS
+	jp COUTE_QUIT
+
+COU18:
+	cp 'Y'   ; Clear screen from the cursor
+	jr nz, COU19
+	ld bc, (CURY)
+	push bc
+	ld a, 80
+	sub b
+	ld c, a
+	call CLEARSTRING
+	pop bc
+	push bc
+COU18_1:
+	ld a, (CURY)
+	inc a
+	cp 25
+	jr z, COU18_2
+	ld (CURY), a
+	ld c, 80
+	call CLEARSTRING
+	jr COU18_1
+
+COU18_2:
+	pop bc
+	ld (CURY), bc
+	jp COUTE_QUIT
+
+COU19:
+	cp '+'   ; Clear screen (Televideo912?)
+	jr nz, COU1A
+	jp COUT_CLS
+
+COU1A:
+	cp 'E'   ; Insert line (& scroll down)
+	jp nz, COUTE_QUIT
+	;; set cursor x=79, y=0
+	ld d, 79
+	ld e, 0
+	ld c, BFN_LOCATE
+	call CBIOS
+	ld a, (CURY)
+	ld d, a
+	ld e, 23
+	ld b, 1
+	ld c, BFN_SCROLL
+	call CBIOS
+	jp COUTE_QUIT
+
+	;; Escape level-2
+COU2:
+	cp 2
+	jr nz, COU3
+	;; Cursor Y
+	ld a, c
+	sub 20h
+	jp c, COUTE_QUIT
+	cp 24
+	jp nc, COUTE_QUIT
+	ld (CURY), a
+	ld a, 3
+	ld (ESCNUM), a
+	ret
+
+	;; Escape level-3
+COU3:
+	cp 3
+	jp nz, COUTE_QUIT
+	;; Cursor move
+	ld a, c
+	sub 20h
+	jp c, COUTE_QUIT
+	cp 80
+	jp nc, COUTE_QUIT
+	ld (CURX), a
+	call SETCURSOR
+	jp COUTE_QUIT
+
+
+CON_STORE:
+	di
+	ld hl, CONBUF
+	ld a, (CONLEN)
+	ld d, 0
+	ld e, a
+	add hl, de
+	ld (hl), c
+	inc a
+	ld (CONLEN), a
+	ei
+	ret
+
+CON_STROUT:
+	di
+	push af
+	ld a, (CONLEN)
+	or a
+	jr z, CON_STROUT_E
+	;; change stack
+	ld (CPMSP), sp
+	ld sp, (BIOSSP)
+	push bc
+	ld c, a
+	ld ix, CONBUF
+	call PUTSTRING
+	xor a
+	ld (CONLEN), a
+	pop bc
+	;; restore stack
+	ld sp,(CPMSP)
+CON_STROUT_E:
+	pop af
+	ei
+	ret
+
+;================================
+;LIST:
+;================================
+LIST:
+	;; LIST is not supported
+	ret
+
+;================================
+;LISTST:
+;================================
+LISTST:
+	;; LISTST is not supported
+	ret
+
+;================================
+;PUNCH:
+;================================
+PUNCH:
+	;; PUNCH is not supported
+	ret
+
+;================================
+;READER:
+;================================
+READER:
+	;; READER is not supported
+	ret
+;
+;================================
+;HOME
+;  Move disc head to track 0
+;================================
+HOME:
+	;; TODO: deblocking
+	ret
+
+;================================
+;SELDSK: 
+;  Select disk drive
+;  C: new target disk
+;
+;  returns 
+;    HL : Disk parameter header or 0 if cannot be selected
+;================================
+SELDSK:
+	ld a, c
+	ld hl, 0
+	cp MAXDISK + 1
+	jr nc, SELDSK_ERR
+	ld (DISKNO), a 
+	add a, a
+	add a, a
+	add a, a
+	add a, a
+	ld l, a
+	ld de, DPBASE
+	add	hl, de
+	; clear host disk status
+	call RST_HOST_DISK
+	ret
+
+SELDSK_ERR:
+	;; TODO
+	ret
+
+;================================
+;SETTRK:
+;  Set track
+;  BC: 0 base track number (in physical)
+;================================
+SETTRK:
+	ld a, c
+	ld (TRACK), a
+	ret
+
+;
+;================================
+;SETSEC
+;  BC: logical sector (128byte/sector)
+;================================
+SETSEC:
+	ld a, c
+	ld (SECTOR), a
+	ret
+;
+;================================
+;SETDMA
+;================================
+SETDMA:	
+	ld	(DMAADR), bc
+	ret
+;
+;
+;================================
+;READ
+; Read the currently set track and sector into the current DMA
+;================================
+READ:
+	call SAME_SECTOR
+	jr c, READ_TRANS
+	call PREP_DISK_ACC
+	;; exec read
+	ld c, BFN_FDREAD
+	call CBIOS
+	jr c, READ_ERR
+READ_TRANS:
+	call PREP_TRANS
+	ldir
+UPDATE_HST:
+	;; update track/sector
+	ld a, (TRACK)
+	ld (HSTTRK), a
+	ld a, (SECTOR)
+	ld (HSTSEC), a
+	xor a
+	ret
+READ_ERR:
+	call RST_HOST_DISK
+	ld a, 1
+	ret
+
+;;
+;; R/W common utils
+;;
+RST_HOST_DISK:
+	ld a, 0ffh
+	ld (HSTDRV), a
+	ld (HSTTRK), a
+	ld (HSTSEC), a
+	ret
+
+	; Check the same drive/track/sector
+	;  Carry if the same
+SAME_SECTOR:
+	ld a, (HSTDRV)
+	ld c, a
+	ld a, (DISKNO)
+	cp c
+	jr nz, NOT_SAME
+	ld a, (HSTTRK)
+	ld c, a
+	ld a, (TRACK)
+	cp c
+	jr nz, NOT_SAME
+	ld a, (HSTSEC)
+	and 0feh
+	ld c, a
+	ld a, (SECTOR)
+	and 0feh
+	cp c
+	jr nz, NOT_SAME
+	scf
+	ret
+NOT_SAME:
+	or a	;; clear carry
+	ret
+
+	; Make Pasopia BIOS ready for 
+	; disk operation (set parameters)
+PREP_DISK_ACC:
+	;; track .. alrady in physical track#
+	ld a,(TRACK)
+	ld d, a
+	;; Convert logical sector into physical sector
+	;;  logical sector = 128byte
+	;;  physical sector = 256 byte, 16 sector, 2 head
+	;;  physical sector = (LogSec / 2)  and 0xf
+	;; Note: sector is in byte
+	ld a,(SECTOR)
+	srl a
+	ld c, a
+	and 0fh
+	inc a		; BIOS sector start from #1
+	ld e, a
+	;; Drive number
+	ld a, (DISKNO)
+	ld b, a
+	;; head
+	ld a, c
+	and 10h
+	sla a
+	sla a
+	sla a
+	or b
+
+	; Pasopia7 Bios
+	;  HL Buffer
+	;  D  Track
+	;  E  Sector
+	;  B  Num Sector
+	;  A  side (80h) & drive (07h?)
+	ld bc, 0112h
+	ld hl, DEBBUF
+	call CBIOS
+	ret
+
+	; Prepare for LDIR
+	;  - for read: DEBBUF -> DMA
+	;   (for write, flip de & hl)
+PREP_TRANS:
+	ld de, (DMAADR)
+	ld hl, DEBBUF
+	ld a, (SECTOR)
+	and 1
+	jr z, PREP_TRANS2
+	ld hl, DEBBUF + 128
+PREP_TRANS2:
+	ld bc, 128
+	ret
+
+;================================
+; WRITE
+;  Write the currently set track and sector
+;
+;  C: deblocking code?
+;    0: Write can be deferred
+;       .. pre-read & write if requred
+;    1: Write immediate
+;	    .. pre-read & write
+;    2: Write can be deferred, no pre-read is nesessary
+;       .. handle as 0
+;================================
+WRITE:
+	call PREP_DISK_ACC
+	;; prep-read
+	ld c, BFN_FDREAD
+	call CBIOS
+	;; transfer write data
+	call PREP_TRANS
+	push hl
+	push de
+	pop hl
+	pop de
+	;; Copy DMA -> DEBBUF
+	ldir
+
+	;; Do write
+	ld c, BFN_FDWRITE
+	call CBIOS
+	jr c, WRITE_ERR
+	jp UPDATE_HST
+
+WRITE_ERR:
+	cp 8	;; write protect
+	jr nz, WRITE_ERR2
+	call RST_HOST_DISK
+	ld a, 2  ;; write protect .. maybe not used by BDOS..
+	ret
+
+WRITE_ERR2:
+	call RST_HOST_DISK
+	ld a, 1	;; unrecovererable error
+	ret
+
+;================================
+; SECTRA
+;Sector Translation
+; BC: logical sector
+; DE: translation table address
+; HL: physical sector number
+;================================
+SECTRA:
+	; Sector translation is not used
+	; Only returns received sector numer
+	ld	h, b
+	ld	l, c
+	ret
+
+;; Enable Text VRAM
+;;
+;; NOTE: TVRAM_ON - TVRAM_OFF should be atomic.
+;;    (i.e. interrupt should be disabled)
+TVRAM_ON:
+	ex af, af'
+	in a,(22h)
+	ld (MEMST), a  ;; backup
+	or 04h
+	out (3ch), a   ;; vram on
+	ld a, 44h
+	out (0ch), a	;; select text plane
+	ex af, af'
+	ret
+
+CALC_TVRAM:
+	ld a, (CURY)
+	ld l, a
+	ld h, 0
+	;; 80 = 16 + 64
+	add hl, hl
+	add hl, hl  ; x4
+	add hl, hl	; x8
+	add hl, hl  ; x16
+	ld d, h
+	ld e, l
+	add hl, hl  ; x32
+	add hl, hl  ; x64
+	add hl, de
+	;; x8 
+	add hl, hl
+	add hl, hl
+	add hl, hl
+	ex de, hl
+	;; x = x * 8
+	ld a, (CURX)
+	ld l, a
+	ld h, 0
+	add hl, hl
+	add hl, hl
+	add hl, hl
+	add hl, de
+	ld de,08000h  ;; vram top
+	add hl, de
+	ret
+
+	;; Clear
+	;;  c: count
+CLEARSTRING:
+	di
+	call TVRAM_ON
+	call CALC_TVRAM
+	xor a
+	out (0dh), a ;; normal attribute
+	ld de, 8
+CLEARST_LOOP:
+	ld a, ' '
+	ld (hl), a
+	add hl, de
+	dec c
+	ld a, c
+	or a
+	jr nz, CLEARST_LOOP
+	;; TVRAM off
+	ld a, (MEMST)
+	out (3ch), a
+	ret
+
+
+
+;;  Whole screen scroll 
+;;  (not using BIOS)
+;;  - c : should be 1 
+SCR_SCROLL:
+	di
+	call TVRAM_ON
+	jp SCROLL_ENT
+
+;; String output
+;;   - c : count
+;;   - IX : pointer to string
+PUTSTRING:
+	di
+	call TVRAM_ON
+	ld a, (ATTRIB)
+	out (0dh), a
+	xor a
+	out (0eh), a ;; attribute non-warp-around
+	call CALC_TVRAM
+PUTCHAR_LOOP:
+	ld b, (ix)
+	ld (hl), b
+	;; increment cursor pos
+	inc ix
+	ld de, 8
+	add hl, de
+	inc a
+	cp 80
+	jr c, PUTCHAR2
+	xor a
+	ld (CURX), a
+	ld de, -81*8
+	add hl, de
+	ld a, (CURY)
+	inc a
+	cp 24
+	jr c, PUTCHAR3
+SCROLL_ENT:
+	push bc
+	push hl
+	dec a
+	ex af, af'
+	ld a, 10h
+	out (0eh), a ;; atrribute data wrap-around
+	ex af, af'
+	;; scroll-up
+	ld de, 8000h
+	ld hl, 8000h + (80 * 8)
+	ld bc, 80*24    ;; include copying blank line(line 25)
+PUTCHR_SCROLL2:
+	ldi
+	jp po, PUTCHR_SCROLL3
+	push bc
+	ld bc, 7
+	add hl, bc
+	ex de, hl
+	add hl, bc
+	ex de, hl
+	pop bc
+	jr PUTCHR_SCROLL2	
+PUTCHR_SCROLL3:	
+	ex af, af'
+	xor a
+	out (0eh), a ;; attribute non-warp-around
+	ex af, af'
+	pop hl
+	pop bc
+
+PUTCHAR3:
+	ld (CURY), a
+	ld a,(CURX)
+	jr PUTCHAR4
+
+PUTCHAR2:
+	ld (CURX), a
+
+PUTCHAR4:
+	dec c
+	jr nz, PUTCHAR_LOOP
+	;; VRAM OFF
+	ld a, (MEMST)
+	out (3ch), a
+	call SETCURSOR
+	;ei
+	ret
+
+;;
+;; Update cursor pos
+;;
+SETCURSOR:
+	ld a, (CURY)
+	ld l, a
+	ld h, 0
+	;; 80 = 16 + 64
+	add hl, hl
+	add hl, hl  ; x4
+	add hl, hl	; x8
+	add hl, hl  ; x16
+	ld d, h
+	ld e, l
+	add hl, hl  ; x32
+	add hl, hl  ; x64
+	add hl, de
+	;;
+	ld a, (CURX)
+	ex de, hl
+	ld l, a
+	ld h, 0
+	add hl, de
+	ld a, 14
+	out (10h), a
+	ld a, h
+	out (11h), a
+	ld a, 15
+	out (10h), a
+	ld a, l
+	out (11h), a
+	ret
+
+;;---------------------------------------
+;; CTC3 Interrupt handling
+;;   - Output buffered string
+;;---------------------------------------
+INT_CTC3:
+	push hl
+	push af
+	;; modify stack pointer
+	ld a,(SPSTAT)
+	cp SP_INT
+	jr z, INT_CTC3_1
+	ld (TMPSP), sp
+	ld sp,(INTSP)
+	push af
+	ld a, SP_INT
+	ld (SPSTAT), a
+	jp INT_CTC3_2
+INT_CTC3_1:
+	push af
+INT_CTC3_2:
+	push de
+	push bc
+	;; String output
+	ld a, (CONCOUNT)
+	inc a
+	ld (CONCOUNT), a
+	and 15				;; 62Hz /16 = 3.875Hz
+	jr z, INT_CTC3_3
+	ld a, (CONLEN)
+	or a
+	jr z, INT_CTC3_3
+	ld c, a
+	push ix
+	ld ix, CONBUF
+	xor a
+	ld (CONLEN), a
+	;; preserve af'
+	ex af, af'
+	push af
+	ex af, af'
+	call PUTSTRING
+	ex af, af'
+	pop af
+	ex af, af'
+
+	pop ix
+INT_CTC3_3:
+	ld hl, CTC3_ENTRY
+	jp JPBIOS4
+
+	;;---------------------------------------
+	;; pacthed interrupt handling
+	;; (calling BIOS)
+	;;---------------------------------------
+JPBIOS:
+	;; (HL is already pushed)
+	push af
+	;; modify stack pointer
+	ld a,(SPSTAT)
+	cp SP_INT
+	jr z, JPBIOS1
+	ld (TMPSP), sp
+	ld sp,(INTSP)
+	push af
+	ld a, SP_INT
+	ld (SPSTAT), a
+	jp JPBIOS2
+JPBIOS1:
+	push af
+JPBIOS2:
+	push de
+	push bc
+JPBIOS4:
+	;; Enable BIOS
+	in a,(22h)
+	and 03h
+	push af
+	or 01h
+	out (3ch), a
+	call INT_BIOS_ENTRY
+	di
+	pop bc
+	in a,(0eh)
+	and 02h
+	add a, a
+	or b
+	out (3ch),a
+	pop bc
+	pop de
+
+	pop af
+	ld (SPSTAT), a
+	cp SP_INT
+	jr z, JPBIOS3
+	ld sp,(TMPSP)
+JPBIOS3:
+	pop af
+	pop hl
+	ei
+	reti
+
+;;---------------------------------------
+;; Calling Pasopia BIOS
+;;  NOTE: 
+;;    memory mapping status is not preserved
+;;    always set to 'all RAM' mode when return
+;;---------------------------------------
+CBIOS:
+	di
+	ld (CPMSP), sp
+	ld sp, (BIOSSP)
+	push af
+	;; BIOS on
+	ld a, 03h
+	out (3ch), a
+	pop af
+	ei
+	;; bios call
+	call BIOS_ENTRY
+	;; Back to RAM 
+	di
+	ld c, a
+	ld a, 02h
+	out (3ch), a
+	ld sp,(CPMSP)
+	ld a, c
+	ei
+	ret
+
+;;---------------------------------------
+;; Load binary from disk
+;;  (from bootloader code)
+;;---------------------------------------
+LOADCPM:
+	ld hl,CPMSTARTSEC
+	ld (STARTSEC), hl
+	ld hl, CPMENDSEC
+	ld (ENDSEC), hl
+	ld hl, CCP
+	ld (READADDR), hl
+
+LOADER:
+    ld de, (STARTSEC)
+
+LOAD_LOOP:
+    ld a,(ENDSEC+1)  ;; end track
+    cp d
+    jr z, FINALTRK
+    ;; full track read
+    ld c, 16
+    jr LOADER2
+
+FINALTRK:
+    ;; partial read
+    ld a, (ENDSEC)
+    ld c, a
+
+LOADER2:
+    ;; calc num sectors
+    ;; e: sector# read from (1-base)
+    ;; c: sector# to
+    inc c
+    ld a, c
+    sub e
+    ld b, a
+    ;; HL = B * 256 (=num bytes to read)
+    ld l, 0
+    ld h, b
+    push hl
+    ld hl, (READADDR)
+    ld b, a  ;; b = num-sectors
+    ;; d: track#
+    ld a, d
+    push af
+
+    ;; a .. logical track# (0-80 track)
+    ;; e .. sector read from (1-base)
+    ;; b .. num sectors to read
+    ;; hl .. address to write
+    ld c, 00
+    srl A
+    rr C
+    ld d, a
+    ;LD E, 01
+    ld a, c
+    ld c, BFN_FDPARAM
+    push hl
+    ;HL Buffer
+    ;D  Track
+    ;E  Sector
+    ;B  Num Sector
+    ;A  0x80: side	
+    call CBIOS
+    ld c, BFN_FDREAD
+    call CBIOS
+    pop hl
+
+    ;; check end of track
+    ld a, (ENDSEC+1)
+    ld b, a
+    POP af
+    pop de
+    cp b
+    ret z
+
+    add hl, de
+    ld (READADDR), hl
+
+    ;; next track
+    inc a
+    ld d, a
+    ld e, 1     ;; read from 1sector
+    ;; d : track#
+    ;; e : sector# read from
+
+    jr LOAD_LOOP
+
+;; Host Drive, Track, Sector
+HSTDRV:
+	DB	0ffh
+HSTTRK:
+	DB	0ffh
+HSTSEC:
+	DB	0ffh
+
+;; Not used
+WRTFLG:	DB	0
+
+;; Current Drive, Track, Sector
+DISKNO:
+	DB	0
+TRACK:
+	DB	0h
+SECTOR:
+	DB	0h
+
+;; Current DMA address
+DMAADR:
+	DW	0080H
+
+;; Buffer for Deblocking
+;;  -- also used as temp at reboot
+DEBBUF:
+	DS 256		
+
+;; Directory buffer
+DIRBUF:	
+	DS	128	
+
+;; Output Console Buffer
+CONBUF:
+	DB  '60K CP/M Version 2.2 for Pasopia7'
+CONINTSTR:
+	DS  128 - ($-CONBUF)
+CONLEN:
+	DB  (CONINTSTR - CONBUF)
+CONCOUNT:
+	DB  0
+
+
+;; BIOS Stack address
+INTSP: DW  0
+BIOSSP: DW 0
+CPMSP: 	DW  0
+TMPSP:	DW  0
+
+SPSTAT:	DB  0
+SP_INT	EQU	 0
+SP_CPM	EQU  1
+
+;; Last input 
+LASTCN:	DB  0
+;; Escape sequence
+ESCNUM:	DB  0
+;; Cursor position
+CURY:	DB  0
+CURX:	DB  0
+
+ATTRIB:	DB  7
+
+MEMST:	DB  0
+
+
+;; Disk parameter header for disk A (16bytes)
+DPBASE:
+	DW	0			; Address of sector translation table (not used)
+	DW	0			; 
+	DW	0			; Ued by CP/M
+	DW	0			;
+	DW	DIRBUF		; Address of 128-byte sector buffer
+	DW	DPBLK		; Address of DPB (Disk parameter block)
+	DW	CHK00		; Address of the directory checksum vector
+	DW	ALL00		; Address fo the allocation vector
+;; DPH for disk B
+	DW	0			; Address of sector translation table (not used)
+	DW	0			; 
+	DW	0			; Ued by CP/M
+	DW	0			;
+	DW	DIRBUF		; Address of 128-byte sector buffer
+	DW	DPBLK		; Address of DPB (Disk parameter block)
+	DW	CHK01		; Address of the directory checksum vector
+	DW	ALL01		; Address fo the allocation vector
+;
+;; Disk parameter (common to all disks)
+;;  - Sharp X1 CP/M 'Language Master' compatible
+DPBLK:
+	DW	64	;SEC PER TRACK
+	DB	4	;BLOCK SHIFT
+	DB	15	;BLOCK MASK
+	DB	1	;EXTNT MASK
+	DW	151	;DISK SIZE-1
+	DW	63	;DIRECTORY MAX
+	DB	80H	;ALLOC0
+	DB	0	;ALLOC1
+	DW	10H	;CHECK SIZE
+	DW	2	;OFFSET
+
+; Check vector
+CHK00:	DS	16		
+CHK01:	DS	16		
+
+; Allocation vector
+ALL00:	DS	31		
+ALL01:	DS	31		
+
+	.dephase
+	END
