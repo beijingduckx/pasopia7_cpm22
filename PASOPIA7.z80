@@ -77,6 +77,8 @@ INT_BIOS_ENTRY equ 4005h
 ;;
 BFN_INKEY  equ 2
 BFN_CURON  equ 5
+BFN_CUROFF  equ 6
+BFN_DEFPF	equ 8
 BFN_FDPARAM equ 18
 BFN_FDREAD  equ 19
 BFN_FDWRITE equ 20
@@ -118,6 +120,7 @@ BOOT:
 	ld a, 41h		;; LIST .. CRT, CON .. CRT
 	ld (IOBYTE), a
 	call INTSCN
+	call INITPF
 	di
 	;; Patch CTC3 interrupt
 	;; - for CONOUT buffer
@@ -151,6 +154,19 @@ INTSCN:
 	ld c, BFN_CURON
 	call CBIOS
 	ret
+
+	;; Make PF key defs empty
+INITPF:
+	ld b, 1
+	ld de, CONCOUNT  ;; used for null string buffer
+INITPF1:
+	ld c, BFN_DEFPF	
+	call CBIOS
+	inc b
+	ld a, b
+	cp 17
+	ret z
+	jr INITPF1
 
 
 ;********************
@@ -242,6 +258,8 @@ CONIN_SCAN:
 	nop				;; (not presicely examined)
 	in a,(31h)		;; read keymatrix
 	and 08h			;; Check 'ESC'
+	ld a, 00h
+	out (30h), a   ;; activate KS4 line
 	jr nz, CONIN3
 	ld c, 27		;; ESC code
 	ei
@@ -284,7 +302,10 @@ CONOUT:
 COUT_CR:
 	xor a
 	ld (CURX), a
-	jp SETCURSOR
+	di
+	call SETCURSOR
+	ei
+	ret
 
 COUT_LF:
 	di
@@ -299,10 +320,12 @@ COUT_LF:
 	ld sp, (BIOSSP)
 	call SCR_SCROLL
 	ld sp, (CPMSP)
+	ei
 	ret
 
 COUT_LF2:
 	ld (CURY), a
+	call SETCURSOR
 	ei
 	ret
 
@@ -315,16 +338,18 @@ COUT_BS:
 	xor a
 COUT_BS2:
 	ld (CURX), a
+	call SETCURSOR
 	ei
-	jp SETCURSOR
+	ret
 
 COUT_HOME:
 	di
 	xor a
 	ld (CURX), a
 	ld (CURY), a
+	call SETCURSOR
 	ei
-	jp SETCURSOR
+	ret
 
 	;; Escape squence
 COUT_ESC:
@@ -492,7 +517,9 @@ COU3:
 	cp 80
 	jp nc, COUTE_QUIT
 	ld (CURX), a
+	di
 	call SETCURSOR
+	ei
 	jp COUTE_QUIT
 
 
@@ -807,6 +834,7 @@ SECTRA:
 TVRAM_ON:
 	ex af, af'
 	in a,(22h)
+	and 03h
 	ld (MEMST), a  ;; backup
 	or 04h
 	out (3ch), a   ;; vram on
