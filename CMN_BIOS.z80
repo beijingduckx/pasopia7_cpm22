@@ -1,0 +1,1784 @@
+
+	.Z80
+	ASEG
+
+;; Constants
+MSIZE		EQU	60     ; 60k CPM
+BIAS		EQU	(MSIZE-20)*1024
+BDOS		EQU	BIAS + 3c00h
+CCP		EQU	BIAS + 3400h
+
+BDOS_ENT	EQU 	BDOS + 6
+
+WSTART		EQU	0000H
+IOBYTE		EQU	0003H
+CDISK		EQU	0004H
+BDOSJMP		EQU	0005H
+
+INT_STACK 	EQU	0f800H
+MAIN_STACK	EQU 	0f780h
+VECTOR_HIGH	equ	0f6h
+
+MAXDISK		equ	1    ;; Max disk number (i.e. B drive)
+MAXLINE		equ	24
+
+CPMSTARTSEC	equ	0203h   ;;(track:sector)
+CPMENDSEC   	equ	0308h   
+
+STARTSEC 	equ	DEBBUF
+ENDSEC 	 	equ	DEBBUF + 2
+READADDR 	equ	DEBBUF + 4
+
+; I/O port
+CRTC		equ	10h
+CTC		equ	28h
+PIOA_DATA	equ	30h
+PIOB_DATA	equ	31h
+PIOA_CTRL	equ	32h
+PIOB_CTRL	equ	33h
+TC_ON		EQU 	0e0h
+TC_OFF		EQU 	0e2h
+FDC_STATUS	EQU 	0e4h
+FDC_DATA	EQU	0e5h
+FDC_CONTROL	EQU	0e6h
+
+
+	org 0100h
+	.PHASE	4A00h + BIAS
+
+;BIOS JP TABLE
+BIOSST:	JP	BOOT
+WBOOTE:
+	JP	WBOOT	
+	JP	CONST	
+	JP	CONIN	
+	JP	CONOUT	
+	JP	LIST	
+	JP	PUNCH	
+	JP	READER	
+	JP	HOME	
+	JP	SELDSK	
+	JP	SETTRK	
+	JP	SETSEC	
+	JP	SETDMA	
+	JP	READ	
+	JP	WRITE	
+	JP	LISTST	
+	JP	SECTRA	
+
+;**********************
+;JP TABLE1
+;BOOT:
+;**********************
+BOOT:
+	di
+	;; dummy stack for BOOT init.
+	ld sp, MAIN_STACK
+	ld a, 41h		;; LIST .. CRT, CON .. CRT
+	ld (IOBYTE), a
+	xor a
+	ld (CDISK), a
+	call INIT_DISP
+
+	ld a, VECTOR_HIGH
+	ld i, a
+	;;
+	;; CTC
+	;;
+	; Interrupt vector
+	ld a, 0f0h
+	out (CTC), a
+	; Channel setting
+	; Reset
+	ld a, 03h
+	out (CTC), a
+	out (CTC+1), a
+	out (CTC+2), a
+	out (CTC+3), a
+	; CTC3 .. about 61Hz
+	ld a, 0a5h
+	out (CTC+3), a
+	ld a, 00h
+	out (CTC+3), a
+	;;
+	;; PIO
+	;;
+	; PIO-A
+	ld a, 0cfh	; Mode3
+	out (PIOA_CTRL), a
+	xor a		; All output
+	out (PIOA_CTRL), a
+	ld a, 07h	; Disable int
+	out (PIOA_CTRL), a
+	ld a, 0ffh	; All strobe
+	out (PIOA_DATA), a
+	; PIO-B
+	ld a, 0fah	; Int Vector
+	out (PIOB_CTRL), a
+	ld a, 0cfh	; Mode3
+	out (PIOB_CTRL), a
+	ld a, 0ffh	; All input
+	out (PIOB_CTRL), a
+	ld a, 097h	; Enable int
+	out (PIOB_CTRL), a
+	xor a
+	out (PIOB_CTRL), a
+
+	COLD_INIT
+
+	JP	GOCPM2
+
+;********************
+;JP TABLE2
+;WBOOT:
+;********************
+WBOOT:	
+	di
+	;; Dummy stack for boot
+	LD SP, MAIN_STACK
+	call LOADCPM
+GOCPM:
+	xor a
+	ld (CONLEN), a
+GOCPM2:
+	;; reset deblocking
+	call RST_HOST_DISK
+	;;  Page zero settings
+	ld hl, WBOOTE
+	ld a, 0c3h
+	ld (WSTART), a
+	ld (WSTART + 1), hl
+	ld hl, BDOS_ENT
+	ld (BDOSJMP), a
+	ld (BDOSJMP + 1), hl
+	;; set DMA
+	ld b, 80h  ; default DMA adddress is 80h
+	call SETDMA
+	;; load current disk (for CCP)
+	ld a, (CDISK)
+	ld c, a
+	ei
+	jp CCP		;CCP Start adr.
+
+;*****************
+;JP TABLE3
+;CONST:
+;*****************
+CONST:
+	;; check pending key
+	ld a, (LASTCN)
+	or a
+	jr nz, CONST3
+	jr CONST2
+CONST3:
+	ld a, 0ffh
+	ret
+CONST2:
+	xor a
+	ret
+
+;************************
+;JP TABLE4
+;CONIN:
+;************************
+CONIN:
+	di
+	ld a, (LASTCN)
+	ld c, a
+	xor a
+	ld (LASTCN), a
+	ei
+	ld a, c
+	or a
+	ret nz
+	jr CONIN
+
+;********************
+;JP TABLE5
+;CONOUT:
+;********************
+CONOUT:
+	di
+	ld a,(ESCNUM)
+	cp 0
+	jp nz, COUT_ESC
+	ld a, c
+	cp 32
+	jp nc, CON_STORE
+	call CON_STROUT
+
+	;; Control characters
+	cp 0dh
+	jr z, COUT_CR
+	cp 0ah
+	jr z, COUT_LF
+	cp 27		; ESC
+	jr z, COUT_ESC
+	cp 08h		; BS
+	jr z,COUT_BS
+	cp 1ah		; Clear screen: Televideo TS803 (for rogue..)
+	jp z,COUT_CLS
+	cp 0ch
+	jp z, COUT_CLS
+	cp 0bh
+	jr z, COUT_HOME
+	ei
+	ret
+
+COUT_CR:
+	xor a
+	ld (CURX), a
+	call SETCURSOR
+	ei
+	ret
+
+COUT_LF:
+	xor a
+	ld (CURX), a
+	ld a, (CURY)
+	inc a
+	cp MAXLINE
+	jr c, COUT_LF2
+IFNDEF PA7010
+	call TVRAM_ON
+ENDIF
+	call WHOLE_SCROLL
+IFNDEF PA7010
+	call TVRAM_OFF
+ENDIF
+	ei
+	ret
+
+COUT_LF2:
+	ld (CURY), a
+	call SETCURSOR
+	ei
+	ret
+
+	;; Backspace	
+COUT_BS:
+	ld a, (CURX)
+	dec a
+	cp 0ffh
+	jr nz, COUT_BS2
+	ld a, (CURY)
+	or a
+	jr z, COUT_BS2
+	dec a
+	ld (CURY), a
+	ld a, 79
+COUT_BS2:
+	ld (CURX), a
+	call SETCURSOR
+	ei
+	ret
+
+COUT_HOME:
+	xor a
+	ld (CURX), a
+	ld (CURY), a
+	call SETCURSOR
+	ei
+	ret
+
+	;; Escape squence
+COUT_ESC:
+	ld a,(ESCNUM)
+	cp 0
+	jr nz, COU1
+	;; first
+	call CON_STROUT
+	ld a,1
+COUTE1:
+	ld (ESCNUM),a
+	ei
+	ret
+
+	;; Reset ESC
+COUTE_QUIT:
+	xor a
+	jr COUTE1
+
+	;; Esc level 1
+COU1:
+	cp 1
+	jp nz, COU2  ;; to level2
+	;; 
+	ld a, c
+	cp '('   ; REV
+	jr nz, COU11
+
+	;; Reverse
+	ld a, (ATTRIB)
+	or REV_ATTRIB
+	ld (ATTRIB), a
+	jr COUTE_QUIT
+
+COU11:
+	cp ')'   ;  Normal
+	jr nz, COU13
+
+	;; Non-reverse
+	ld a, (ATTRIB)
+	and NORM_ATTRIB
+	ld (ATTRIB), a
+	jr COUTE_QUIT
+
+COU13:
+	cp '='   ; Cursor Y X
+	jr nz, COU14
+	;; Cursor mode
+	ld a, 2
+	ld (ESCNUM), a
+	ei
+	ret
+COU14:
+	cp '*'   ; Clear
+	jr nz, COU16
+	;; Clear screen
+COUT_CLS:
+	xor a
+	ld (CURX), a
+	ld (CURY), a
+	ld bc, 80*MAXLINE
+	call CLEARSTRING
+	jr COUTE_QUIT
+
+COU16:
+	cp 'T'   ; clear line (from current cursor)
+	jr nz, COU17
+	ld a, (CURX)
+	ld c, a
+	ld a, 80
+	sub c
+	ld c, a
+	ld b, 0
+	call CLEARSTRING
+	jr COUTE_QUIT
+
+COU17:
+	cp 'R'  ; remove line (scroll up)
+	jr nz, COU18
+	ld a, (CURY)
+	ld d, a
+	ld e, 23
+	ld b, 0
+IFNDEF PA7010
+	call TVRAM_ON
+ENDIF
+	call SCROLL
+IFNDEF PA7010
+	call TVRAM_OFF
+ENDIF
+	jp COUTE_QUIT
+
+COU18:
+	cp 'Y'   ; Clear screen from the cursor
+	jr nz, COU19
+	ld a, (CURX)
+	ld b, a
+	ld a, 80
+	sub b
+	ld c, a
+	ld b, 0
+	call CLEARSTRING
+	; 
+	ld a, (CURY)
+	ld b, a
+	ld a, MAXLINE
+	sub b
+	jr c, COU18_2
+	ld h, 0
+	ld l, a
+	call X80
+	ld b, h
+	ld c, l
+	call CLEARSTRING
+COU18_2:
+	jp COUTE_QUIT
+
+COU19:
+	cp '+'   ; Clear screen (Televideo912?)
+	jr nz, COU1A
+	jp COUT_CLS
+
+COU1A:
+	cp 'E'   ; Insert line (& scroll down)
+	jp nz, COUTE_QUIT
+	ld a, (CURY)
+	ld d, a
+	ld e, 23
+	ld b, 1
+IFNDEF PA7010
+	call TVRAM_ON
+ENDIF
+	call SCROLL
+IFNDEF PA7010
+	call TVRAM_OFF
+ENDIF
+	jp COUTE_QUIT
+
+	;; Escape level-2
+COU2:
+	cp 2
+	jr nz, COU3
+	;; Cursor Y
+	ld a, c
+	sub 20h
+	jp c, COUTE_QUIT
+	cp MAXLINE
+	jp nc, COUTE_QUIT
+	ld (CURY), a
+	ld a, 3
+	ld (ESCNUM), a
+	ei
+	ret
+
+	;; Escape level-3
+COU3:
+	cp 3
+	jp nz, COUTE_QUIT
+	;; Cursor move
+	ld a, c
+	sub 20h
+	jp c, COUTE_QUIT
+	cp 80
+	jp nc, COUTE_QUIT
+	ld (CURX), a
+	call SETCURSOR
+	jp COUTE_QUIT
+
+
+CON_STORE:
+	ld hl, CONBUF
+	ld a, (CONLEN)
+	ld d, 0
+	ld e, a
+	add hl, de
+	ld (hl), c
+	inc a
+	ld (CONLEN), a
+	ei
+	ret
+
+CON_STROUT:
+	push af
+	ld a, (CONLEN)
+	or a
+	jr z, CON_STROUT_E
+	push bc
+	ld c, a
+	ld ix, CONBUF
+	call PUTSTRING
+	xor a
+	ld (CONLEN), a
+	pop bc
+CON_STROUT_E:
+	pop af
+	ret
+
+;================================
+;LIST:
+;================================
+LIST:
+	;; LIST is not supported
+	ret
+
+;================================
+;LISTST:
+;================================
+LISTST:
+	;; LISTST is not supported
+	ret
+
+;================================
+;PUNCH:
+;================================
+PUNCH:
+	;; PUNCH is not supported
+	ret
+
+;================================
+;READER:
+;================================
+READER:
+	;; READER is not supported
+	ret
+;
+;================================
+;HOME
+;  Move disc head to track 0
+;================================
+HOME:
+	;; TODO: deblocking
+	ret
+
+;================================
+;SELDSK: 
+;  Select disk drive
+;  C: new target disk
+;
+;  returns 
+;    HL : Disk parameter header or 0 if cannot be selected
+;================================
+SELDSK:
+	ld a, c
+	ld hl, 0
+	cp MAXDISK + 1
+	jr nc, SELDSK_ERR
+	ld (DISKNO), a 
+	add a, a
+	add a, a
+	add a, a
+	add a, a
+	ld l, a
+	ld de, DPBASE
+	add	hl, de
+	; clear host disk status
+	call RST_HOST_DISK
+	ret
+
+SELDSK_ERR:
+	;; TODO
+	ret
+
+;================================
+;SETTRK:
+;  Set track
+;  BC: 0 base track number (in physical)
+;================================
+SETTRK:
+	ld a, c
+	ld (TRACK), a
+	ret
+
+;================================
+;SETSEC
+;  BC: logical sector (128byte/sector)
+;================================
+SETSEC:
+	ld a, c
+	ld (SECTOR), a
+	ret
+
+;================================
+;SETDMA
+;================================
+SETDMA:	
+	ld	(DMAADR), bc
+	ret
+
+;================================
+;READ
+; Read the currently set track and sector into the current DMA
+;================================
+READ:
+	call SAME_SECTOR
+	jr c, READ_TRANS
+	call PREP_DISK_ACC
+	;; exec read
+	ld hl, DEBBUF
+	ld a, FDD_RW_READ
+	call fdd_rw
+	jr c, READ_ERR
+READ_TRANS:
+	call PREP_TRANS
+	ldir
+UPDATE_HST:
+	;; update track/sector
+	ld a, (DISKNO)
+	ld (HSTDRV), a
+	ld a, (TRACK)
+	ld (HSTTRK), a
+	ld a, (SECTOR)
+	ld (HSTSEC), a
+	xor a
+	ret
+READ_ERR:
+	call RST_HOST_DISK
+	ld a, 1
+	ret
+
+;;
+;; R/W common utils
+;;
+RST_HOST_DISK:
+	ld a, 0ffh
+	ld (HSTDRV), a
+	ld (HSTTRK), a
+	ld (HSTSEC), a
+	ret
+
+	; Check the same drive/track/sector
+	;  Carry if the same
+SAME_SECTOR:
+	ld a, (HSTDRV)
+	ld c, a
+	ld a, (DISKNO)
+	cp c
+	jr nz, NOT_SAME
+	ld a, (HSTTRK)
+	ld c, a
+	ld a, (TRACK)
+	cp c
+	jr nz, NOT_SAME
+	ld a, (HSTSEC)
+	and 0feh
+	ld c, a
+	ld a, (SECTOR)
+	and 0feh
+	cp c
+	jr nz, NOT_SAME
+	scf
+	ret
+NOT_SAME:
+	or a	;; clear carry
+	ret
+
+	; Make Pasopia BIOS ready for 
+	; disk operation (set parameters)
+PREP_DISK_ACC:
+	;; track .. alrady in physical track#
+	ld a,(TRACK)
+	ld d, a
+	;; Convert logical sector into physical sector
+	;;  logical sector = 128byte
+	;;  physical sector = 256 byte, 16 sector, 2 head
+	;;  physical sector = (LogSec / 2)  and 0xf
+	;; Note: sector is in byte
+	ld a,(SECTOR)
+	srl a
+	ld c, a
+	and 0fh
+	inc a		; BIOS sector start from #1
+	ld e, a
+	;; Drive number
+	ld a, (DISKNO)
+	ld b, a
+	;; head
+	ld a, c
+	and 10h
+	sla a
+	sla a
+	sla a
+	or b
+
+	; Pasopia7 Bios
+	;  HL Buffer
+	;  D  Track
+	;  E  Sector
+	;  B  Num Sector
+	;  A  side (80h) & drive (07h?)
+	ld bc, 0112h
+	call fdd_setparam
+	ret
+
+	; Prepare for LDIR
+	;  - for read: DEBBUF -> DMA
+	;   (for write, flip de & hl)
+PREP_TRANS:
+	ld de, (DMAADR)
+	ld hl, DEBBUF
+	ld a, (SECTOR)
+	and 1
+	jr z, PREP_TRANS2
+	ld hl, DEBBUF + 128
+PREP_TRANS2:
+	ld bc, 128
+	ret
+
+;================================
+; WRITE
+;  Write the currently set track and sector
+;
+;  C: deblocking code?
+;    0: Write can be deferred
+;       .. pre-read & write if requred
+;    1: Write immediate
+;	    .. pre-read & write
+;    2: Write can be deferred, no pre-read is nesessary
+;       .. handle as 0
+;================================
+WRITE:
+	call PREP_DISK_ACC
+	;; prep-read
+	ld hl, DEBBUF
+	ld a, FDD_RW_READ
+	call fdd_rw
+	;; transfer write data
+	call PREP_TRANS
+	push hl
+	ld h, d
+	ld l, e
+	pop de
+	;; Copy DMA -> DEBBUF
+	ldir
+
+	;; Do write
+	ld hl, DEBBUF
+	ld a, FDD_RW_WRITE
+	call fdd_rw
+	jr c, WRITE_ERR
+	jp UPDATE_HST
+
+WRITE_ERR:
+	cp 8	;; write protect
+	jr nz, WRITE_ERR2
+	call RST_HOST_DISK
+	ld a, 2  ;; write protect .. maybe not used by BDOS..
+	ret
+
+WRITE_ERR2:
+	call RST_HOST_DISK
+	ld a, 1	;; unrecovererable error
+	ret
+
+;================================
+; SECTRA
+;Sector Translation
+; BC: logical sector
+; DE: translation table address
+; HL: physical sector number
+;================================
+SECTRA:
+	; Sector translation is not used
+	; Only returns received sector numer
+	ld	h, b
+	ld	l, c
+	ret
+
+; -------------------
+;
+; Disk I/O
+;
+; -------------------
+
+STATUS_RQM EQU 80h
+STATUS_DIO EQU 40h
+STATUS_NDM EQU 20h
+STATUS_CB EQU 10h
+
+MOTOR_ON  EQU 40h
+MOTOR_OFF EQU 00h
+
+MFM       EQU 40h
+
+FDD_RW_READ  EQU 1
+FDD_RW_WRITE EQU 0
+
+; -------------------
+;  Set FDD R/W param
+;
+; D  : Track#
+; E  : Sector#
+; B  : Number of R/W sectors
+; A  : side 0 0 0 0 0 Drive Drive
+; -------------------
+fdd_setparam:
+	ld ix, fdc_param
+	; Parameter D (cylinder)
+	ld (ix+2), d
+	; Parameter E (Sector)
+	ld (ix+4), e
+	; Others
+	ld (ix+5), 1   ; N=1:256 bytes/sector
+	; Parameter A
+	and 83h ;; mask side & drive
+	ld d, a
+	rlca
+	and 01h
+	ld (ix+3), a   ; Header
+	rlca
+	rlca
+	or d
+	and 07h
+	ld (ix+1), a   ; HD, US1, US0
+	; Parameter B
+	ld (ix+9), b   ; Number of sectors
+	ld a, b
+	add a, e
+	dec a
+	ld (ix+6), a   ; EOT
+	ld (ix+7), 0eh   ; GSL
+	ld (ix+8), 0ffh   ; DTL
+	ret
+
+; -------------------
+;  FDD Read/Write 
+;
+; HL : Read/Write data area
+;  a : 0 : write, 1: read
+; -------------------
+fdd_rw:
+	push hl
+	; preserve command code
+	ld (fdc_param + 10), a
+	; Prepare for R/W
+	ld a, MOTOR_ON
+	out (FDC_CONTROL), a
+	call sense_int_status
+	jr c, fdd_other_err
+	; check same track
+	ld hl, cur_track
+	ld a, (fdc_param + 1)  ; HD, US1, US0
+	and 03h
+	ld d, 0
+	ld e, a
+	add hl, de
+	ld a, (fdc_param + 2)  ; Cylinder
+	ld d, a
+	ld a, (hl)
+	ld e, a
+	cp 0ffh
+	jr nz, fdd_rw2
+	push de
+	call recalibrate
+	pop de
+	jr c, fdd_other_err
+fdd_recalib2:
+	call sense_int_status
+	jr c, fdd_err
+	; check seek end
+	and 20h
+	jr z, fdd_recalib2
+fdd_rw2:
+	ld a, d
+	cp e
+	; not same .. seek
+	; - Workaround: (Emulator bug?) 
+	;   always seek for cheking drive status
+	; jr z, fdd_rw3 
+	call seek
+	jr c, fdd_other_err
+fdd_rw21:
+	call sense_int_status
+	jr c, fdd_err
+	; check seek end
+	and 20h
+	jr z, fdd_rw21
+
+	call update_cur_track
+fdd_rw3:
+	; Set FDC command
+	ld a, (fdc_param+10)
+	or a
+	jr z, fdd_write
+	ld a, 06h or MFM
+	jr fdd_rw_setcom
+fdd_write:
+	ld a, 05h or MFM
+fdd_rw_setcom:
+	ld (fdc_param), a
+	ld c, 9
+	di
+	call c_phase
+	jr c, fdd_other_err
+	; Exec R/W
+	pop hl         ; Read/write buffer
+	ld a, (fdc_param+9) ; Number of sectors
+	ld d, a
+	ld e, 0        ; de = number of read (256bytes/sector)
+	call e_phase
+	call r_phase
+	ei
+	jr c, other_error
+	; Check status
+	ld a, (fdc_resp)
+	ld c, a
+	and 0c0h
+	jr z, fdd_set_motor_off   ; normal end
+	; Error
+	ld a, c
+	bit 3, a
+	jr nz, not_ready_err
+	ld a, (fdc_resp+1)
+	bit 1, a
+	jr nz, wp_err
+	jr other_error
+wp_err:
+	ld a, 8
+	scf
+	jr fdd_set_motor_off
+
+fdd_err:
+	pop hl
+	jr fdd_set_motor_off
+
+fdd_other_err:
+	ei
+	pop hl
+	jr other_error
+
+fdd_set_motor_off:
+	push af
+	di
+	ld a, (INTCOUNT)
+	dec a
+	ld (MOTOR_OFF_TIME), a
+	ei
+	pop af
+	ret
+
+	; -------------------
+	; SEEK
+	; -------------------
+seek:   
+	ld a, 0Fh
+	ld (fdc_param), a
+	ld c, 3
+	call c_phase
+	ret c
+	call wait_int
+	ret
+
+update_cur_track:
+	; Updte current track
+	ld hl, cur_track
+	ld a, (fdc_param + 1)
+	and 03h
+	ld d, 0
+	ld e, a
+	add hl, de
+	ld a, (fdc_param + 2)
+	ld (hl), a
+	ret
+
+	; -------------------
+	; SENSE INTERRUPT STATUS
+	; -------------------
+sense_int_status:
+	ld a, 08h
+	ld (fdc_param), a
+	ld c, 1
+	call c_phase
+	ret c
+
+	call r_phase
+	ret c
+
+	ld a, (fdc_resp)
+	cp 80h
+	ld c, a
+	; Invalid is treated as normal
+	jr z, sense_int_normal
+	; Equipment check, Not ready
+	ld c, a
+	and 18h
+	jr nz, not_ready_err
+	; Interrupt Code check
+	ld a, c
+	and 0c0h
+	jr z, sense_int_normal
+other_error:
+	ld a, 0ffh
+	scf
+	jr fdd_set_motor_off
+
+not_ready_err:
+	ld a, 01h
+	scf
+	jr fdd_set_motor_off
+
+sense_int_normal:
+	ld a, c
+	; Normal end
+	ret
+
+recalibrate:
+	ld a, 07h
+	ld (fdc_param), a
+	ld c, 2
+	call c_phase
+	ret c
+	call wait_int
+	ret
+
+	; -----------------------------
+	; C-PHASE
+	; C : number of parameter
+	; -----------------------------
+c_phase:
+	; wait cb=0
+	in a, (FDC_STATUS)
+	cp 0ffh
+	jr nz, c_phase1
+	; unexpected error
+	; FDC reset needed
+	scf
+	ret
+c_phase1:        
+	and status_cb
+	jr nz, c_phase
+	ld hl, fdc_param
+
+	; send parameters
+wait_rqm:
+	; wait RQM=1, DIO = 0
+	in a, (FDC_STATUS)
+	and (STATUS_RQM or STATUS_DIO)
+	cp STATUS_RQM
+	jr nz, wait_rqm
+
+	; Write parameter
+	ld a,(hl)
+	out (FDC_DATA), a
+	inc hl
+	dec c
+	jr nz, wait_rqm
+	ret
+
+wait_int:
+	; wait int = 1 (no timeout)
+	in a, (FDC_CONTROL)
+	bit 7, a
+	jr z, wait_int
+	ret
+
+	; -----------------------------
+	; E-PHASE
+	; HL : pointer to data area
+	; DE : number of read/write
+	; -----------------------------
+e_phase:
+	; With wait_int, it greatly hit
+	; access performance on emualtor
+	;call wait_int
+	ld bc, 00e5h
+e_phase1:
+	; Check RQM=1
+	in a, (FDC_STATUS)
+	rlca
+	jr nc, e_phase1
+	; Check DIO
+	rlca 
+	jr nc, e_phase_write
+	; Check NDM
+	rlca
+	jr nc, e_phase_end
+e_phase_read:
+	ini
+	;jr nz, e_phase1
+	dec de
+	ld a, e
+	or d
+	jr nz, e_phase1
+
+e_phase_end:
+	; TC ON - OFF
+	out (TC_ON), a
+	out (TC_OFF), a
+	ret
+
+e_phase_write:
+	; Check NDM
+	rlca
+	jr nc, e_phase_end
+	outi
+	dec de
+	ld a, e
+	or d
+	jr nz, e_phase1
+	jr e_phase_end
+
+	; -----------------------------
+	; R-PHASE
+	; -----------------------------
+r_phase:
+	; With wait_int, it greatly hit
+	; access performance on emualtor
+	;call wait_int
+	ld hl, fdc_resp
+r_phase1:
+	; wait RQM=1, DIO=1
+	in a,(FDC_STATUS)
+	cp 0ffh
+	jr nz, r_phase2
+	; unexpeceted error
+	; FDC reset needed
+	scf
+	ret
+
+r_phase2:
+	rlca
+	jr nc, r_phase1
+	rlca
+	ret nc
+	in a, (FDC_DATA)
+	ld (hl), a
+	inc hl
+	jr r_phase1
+
+
+	; -------------------
+	; WORK RAM
+	; -------------------
+fdc_param:
+	; FDC parameter
+	ds      11
+fdc_resp:
+	; FDC response
+	ds      7
+cur_track:
+	; Current track# (4 drives)
+	db	0ffh, 0ffh, 0ffh, 0ffh
+
+
+;; ----------------------------------------
+;; HL = HL * 80
+;; ----------------------------------------
+X80:
+	push bc
+	add hl, hl
+	add hl, hl
+	add hl, hl
+	add hl, hl
+	ld b, h
+	ld c, l
+	add hl, hl
+	add hl, hl
+	add hl, bc
+	pop bc
+	ret
+
+
+;;---------------------------------------
+;;   Init screen mode
+;;---------------------------------------
+INIT_DISP:
+	; CRTC
+	ld hl, CRTC_DATA
+	ld b, 16
+	ld a, 0
+	ld c, CRTC+1
+INIT_DISP2:
+	out (CRTC), a
+	ld d, (hl)
+	out (c), d
+	inc hl
+	inc a
+	djnz INIT_DISP2
+
+	; Width 80, Text, Color
+	ld a, 20h  
+	out (08h), a
+	; Text-0, attribute white
+	ld a, 07h
+	out (0dh), a
+	; Set to RAM mode
+	ld c, a
+	ld a, 02h
+	out (3ch), a
+
+	ret
+
+;;---------------------------------------
+;; CTC3 Interrupt handling
+;;   - Output buffered string
+;;---------------------------------------
+INT_CTC3:
+	;; modify stack pointer
+	ld (TMPSP), sp
+	ld sp, INT_STACK
+
+	push hl
+	push af
+	push de
+	push bc
+
+	;; String output
+	ld a, (INTCOUNT)
+	inc a
+	ld (INTCOUNT), a
+	and 15				;; 61Hz /16 = 3.81Hz
+	jr z, INT_CTC3_3
+	ld a, (CONLEN)
+	or a
+	jr z, INT_CTC3_3
+	ld c, a
+	push ix
+	ld ix, CONBUF
+	xor a
+	ld (CONLEN), a
+	call PUTSTRING
+	pop ix
+INT_CTC3_3:
+	;; motor off
+	ld a, (INTCOUNT)
+	ld hl, MOTOR_OFF_TIME
+	cp (hl)
+	jr nz, INT_CTC_4
+	ld a, MOTOR_OFF
+	out (FDC_CONTROL), a
+INT_CTC_4:
+	pop bc
+	pop de
+	pop af
+	pop hl
+
+	ld sp,(TMPSP)
+	ei
+	reti
+
+;;---------------------------------------
+;; Load binary from disk
+;;  (from bootloader code)
+;;---------------------------------------
+LOADCPM:
+	ld hl,CPMSTARTSEC
+	ld (STARTSEC), hl
+	ld hl, CPMENDSEC
+	ld (ENDSEC), hl
+	ld hl, CCP
+	ld (READADDR), hl
+
+LOADER:
+	ld de, (STARTSEC)
+
+LOAD_LOOP:
+	ld a,(ENDSEC+1)  ;; end track
+	cp d
+	jr z, FINALTRK
+	;; full track read
+	ld c, 16
+	jr LOADER2
+
+FINALTRK:
+	;; partial read
+	ld a, (ENDSEC)
+	ld c, a
+
+LOADER2:
+	;; calc num sectors
+	;; e: sector# read from (1-base)
+	;; c: sector# to
+	inc c
+	ld a, c
+	sub e
+	ld b, a
+	;; HL = B * 256 (=num bytes to read)
+	ld l, 0
+	ld h, b
+	push hl
+	ld hl, (READADDR)
+	ld b, a  ;; b = num-sectors
+	;; d: track#
+	ld a, d
+	push af
+
+	;; a .. logical track# (0-80 track)
+	;; e .. sector read from (1-base)
+	;; b .. num sectors to read
+	;; hl .. address to write
+	ld c, 00
+	srl A
+	rr C
+	ld d, a
+	;LD E, 01
+	ld a, c
+	push hl
+	;HL Buffer
+	;D  Track
+	;E  Sector
+	;B  Num Sector
+	;A  0x80: side	
+	call fdd_setparam
+	ld a, FDD_RW_READ
+	pop hl
+	push hl
+	call fdd_rw
+	pop hl
+
+	;; check end of track
+	ld a, (ENDSEC+1)
+	ld b, a
+	POP af
+	pop de
+	cp b
+	ret z
+
+	add hl, de
+	ld (READADDR), hl
+
+	;; next track
+	inc a
+	ld d, a
+	ld e, 1     ;; read from 1sector
+	;; d : track#
+	;; e : sector# read from
+
+	jr LOAD_LOOP
+
+;;---------------------------------------
+;;  Key scan & convert
+;;---------------------------------------
+
+CTRL		EQU	10h
+SHIFT		EQU	02h
+GRAPH		EQU	01h
+CONT_REP_COUNT	EQU	2h
+NEW_REP_COUNT	EQU	010h
+
+;;---------------------------------------
+;;  Key matrix scan
+;;
+;; Input:
+;;   None
+;; Output:
+;;  l: Num new key
+;;---------------------------------------
+SCANKEY:
+	ld ix, SCANSIG
+	ld iy, SCANDATA
+	ld l, 0
+	ld c, 0     ; scan code
+	xor a
+	ld (KEYPRESSED), a
+
+SCANKEYLOOP:
+	; Read scan
+	ld a, (ix)
+	or a
+	ret z
+
+	inc ix
+	out (PIOA_DATA), a
+	in a, (PIOB_DATA)
+	cpl
+	or a
+	jr z, SCANKEY1
+	ld (KEYPRESSED), a
+SCANKEY1:
+	ld e, (iy)
+	ld (iy), a
+	inc iy
+	ld d, a
+	; new key .. e
+	xor e
+	ld e, a
+	;  no new key .. 
+	jr z, NEXTSCAN_SKIP
+	;
+	ld a, c
+	or a
+	jr nz, SCANKEY2
+	ld a, e
+	and (CTRL or SHIFT or GRAPH)
+	jr z, SCANKEY2
+NEXTSCAN_SKIP:
+	ld a, c
+	add a, 8
+	ld c, a
+	jr SCANKEYLOOP
+
+SCANKEY2:
+	; rel bits
+	ld a, d
+	cpl
+	and e
+	jr z, SCANKEY3
+
+	; released
+	ld a, l
+	or a
+	jr nz, SCANKEY3
+	ld l, 0
+	ld a, 0ffh
+	ld (ACTIVEKEY), a
+	jr NEXTSCAN_SKIP
+
+SCANKEY3:
+	; new active keys
+	ld a, d
+	and e
+	ld b, 8
+
+	; Get Scan code of the new key
+SCANKEY4:
+	srl a
+	jr nc, SCANKEY5
+	ld e, a
+	ld a, c
+	ld (ACTIVEKEY), a
+	ld a, e
+	inc l
+
+SCANKEY5:
+	inc c
+	djnz SCANKEY4
+
+NEXTSCAN:
+	jr SCANKEYLOOP
+
+;;---------------------------------------
+;;  Decode scanned key 
+;; Input:
+;;  A ... num new keys
+;; Output:
+;;  A .. Key ascii code
+;;---------------------------------------
+KEYDECODE:
+	or a
+	jr nz, KEYDEC_NEWKEY
+	;; Same key
+	ld a, (ACTIVEKEY)
+	cp 0ffh
+	jr nz, KEYDEC_REP
+	; no key
+	xor a
+	scf
+	ret
+
+KEYDEC_REP:
+	ld hl, KREP_COUNT
+	dec (hl)
+	jr z, KEYDEC_REP2
+;	ld b, 0a0h
+;KEYDEC_WAIT:
+;	djnz KEYDEC_WAIT
+	xor a
+	;scf
+	ret
+
+KEYDEC_REP2:
+	ld (hl), CONT_REP_COUNT
+	jr CONV_SCANCODE
+
+KEYDEC_NEWKEY:
+	ld a, (SCANDATA)
+	; CAPS
+	bit 2, a
+	jr z, NEWKEY2
+	ld a, (KEYSTATE)
+	xor 1
+NEWKEY_REV:
+	ld (KEYSTATE), a
+	ld a, 0ffh
+	ld (ACTIVEKEY), a
+	; KANA/CAPS are no key
+	call SETCURSOR
+	scf
+	ret
+
+NEWKEY2:
+	; Kana
+	bit 5, a
+	jr z, NEWKEY3
+	ld a, (KEYSTATE)
+	xor 2
+	jr NEWKEY_REV
+
+NEWKEY3:
+	ld a, NEW_REP_COUNT
+	ld (KREP_COUNT), a
+
+CONV_SCANCODE:
+	;; TODO: click
+	ld a, (SCANDATA)
+	ld c, a
+	ld a, (KEYSTATE)
+	ld b, a
+
+	ld a, (ACTIVEKEY)
+	ld hl, DEFAULT_MAP
+	cp 30h
+	jr c, CONV2
+	; Check Kana mode
+	bit 1, b
+	jr z, CONV1
+	ld hl, SHIFT_KANA
+	jr CONV2
+CONV1:
+	; Check SHIFT
+	bit 1, c
+	jr z, CONV2
+	ld hl, SHIFT_ALPHA
+
+CONV2:
+	; STOP + CTRL + GRAPH
+	cp 23h
+	jr nz, CONV2_0
+	bit 0, c
+	jr z, CONV_ASCII
+	bit 4, c
+	jr z, CONV_ASCII
+	; init IOBYTE & Current Disk
+	ld a, 41h
+	ld (IOBYTE), a
+	xor a
+	ld (CDISK), a
+	call NOKEYSUB
+	ld hl, WBOOT
+	push hl
+	reti
+CONV2_0:
+IFDEF PA7007
+	; INS/DEL
+	cp 1ah
+	jr nz, CONV2_1
+	bit 1, c
+	jr z, CONV2_1
+	ld a, 12h
+	jr CONV4
+CONV2_1:
+	; Up/Down
+	cp 25h
+	jr nz, CONV_ASCII
+	bit 1, c
+	jr z, CONV_ASCII
+	ld a, 1fh
+	jr CONV4
+ENDIF
+CONV_ASCII:
+	ld d, 0
+	ld e, a
+	add hl, de
+	ld a, (hl)
+CONV4:
+	; Check Kana
+	bit 1, b
+	jr nz, CONV3
+	; Not Kana ..
+	; Check caps
+	bit 0, b
+	jr z, CONV_CONTROL
+	;; CAPS 
+	cp 41h
+	jr c, CONV_CONTROL
+	cp 7bh
+	jr nc, CONV_CONTROL
+	cp 61h
+	jr nc, CONV_CASE
+	cp 5bh
+	jr nc, CONV_CONTROL
+CONV_CASE:
+	xor 20h
+	jr CONV_CONTROL
+CONV3:
+	; Kana mode ..
+	; Check SHIFT
+	bit 1, c
+	jr nz, CONV_CONTROL
+	; Kana + non-SHIFT
+	cp 0a1h
+	jr c, CONV_CONTROL
+	cp 0b0h
+	jr nc, CONV_CONTROL
+	ld hl, NORM_KANA
+	sub 0a1h
+	ld d, 0
+	ld e, a
+	add hl, de
+	ld a, (hl)
+
+CONV_CONTROL:
+	; Check CONTROL
+	bit 4, c
+	jr z, KEYCODE_END
+	ld hl, DEFAULT_MAP
+	add hl, de
+	ld a, (hl)
+	and 1fh
+
+KEYCODE_END:
+	;; TODO: Click
+	and a
+	;; carry should be 0
+	ret
+
+KEYSTB_INT:
+	push af
+	; Disable PIOB Int
+	ld a, 03h
+	out (PIOB_CTRL), a
+
+	; Enable CTC-2 
+	; CTC2 .. about 61Hz
+	ld a, 0a5h
+	out (CTC+2), a
+	ld a, 00h
+	out (CTC+2), a
+
+	pop af
+
+	ei
+	reti
+
+KEYREP_INT:
+	ld (TMPSP), sp
+	;push sp
+	ld sp, INT_STACK
+
+	push ix
+	push iy
+	push hl
+	push de
+	push bc
+	push af
+	call SCANKEY
+	ld a, l
+	call KEYDECODE
+	jr c, KEYREP_NOKEY
+	ld (LASTCN), a
+	ld a, 1
+	ld (KEYBUF_COUNT), a
+	jr KEYREP_END
+
+KEYREP_NOKEY:
+	xor a
+	ld (LASTCN), a
+	ld a, (KEYPRESSED)
+	or a
+	jr nz, KEYREP_END
+	call NOKEYSUB
+KEYREP_END:
+	pop af
+	pop bc
+	pop de
+	pop hl
+	pop iy
+	pop ix
+
+	ld sp, (TMPSP)
+	;pop sp
+	ei
+	reti
+
+NOKEYSUB:
+	; STOP CTC-2
+	ld a, 03h
+	out (CTC+2), a
+
+	; Enable Strobe int
+	ld a, 0ffh
+	out (PIOA_DATA), a
+	ld a, 083h	; Enable int
+	out (PIOB_CTRL), a
+
+	ret
+	
+SCANDATA: 
+	DS 12
+ACTIVEKEY: 
+	DB  0ffh
+KEYSTATE:  
+	DB  00h
+KREP_COUNT:
+	DB  00h
+KEYPRESSED:
+	DB  00h
+
+KEYBUF:
+	DB 00h
+KEYBUF_COUNT:
+	DB 00h
+
+SCANSIG:
+	DB  11h, 12h, 14h, 18h
+	DB  21h, 22h, 24h, 28h
+	DB  41h, 42h, 44h, 48h
+	DB 00h
+
+;; --------------------------------
+;;  CP/M Data
+;; --------------------------------
+
+;; Host Drive, Track, Sector
+HSTDRV:
+	DB	0ffh
+HSTTRK:
+	DB	0ffh
+HSTSEC:
+	DB	0ffh
+
+;; Not used
+WRTFLG:	DB	0
+
+;; Current Drive, Track, Sector
+DISKNO:
+	DB	0
+TRACK:
+	DB	0h
+SECTOR:
+	DB	0h
+
+;; Current DMA address
+DMAADR:
+	DW	0080H
+
+;; Buffer for Deblocking
+;;  -- also used as temp at reboot
+DEBBUF:
+	DS 256		
+
+;; Directory buffer
+DIRBUF:	
+	DS	128	
+
+;; Output Console Buffer
+CONBUF:
+	TITLE_MSG
+CONINTSTR:
+	DS  128 - ($-CONBUF)
+CONLEN:
+	DB  (CONINTSTR - CONBUF)
+INTCOUNT:
+	DB  0
+
+;; Stack address
+TMPSP:	DW  0
+
+;; Last input 
+LASTCN:	DB  0
+;; Escape sequence
+ESCNUM:	DB  0
+;; Cursor position
+CURY:	DB  0
+CURX:	DB  0
+
+ATTRIB:	DB  INI_ATTRIB
+
+MEMST:	DB  0
+MOTOR_OFF_TIME:
+	DB  0
+
+;; Disk parameter header for disk A (16bytes)
+DPBASE:
+	DW	0			; Address of sector translation table (not used)
+	DW	0			; 
+	DW	0			; Ued by CP/M
+	DW	0			;
+	DW	DIRBUF		; Address of 128-byte sector buffer
+	DW	DPBLK		; Address of DPB (Disk parameter block)
+	DW	CHK00		; Address of the directory checksum vector
+	DW	ALL00		; Address fo the allocation vector
+;; DPH for disk B
+	DW	0			; Address of sector translation table (not used)
+	DW	0			; 
+	DW	0			; Ued by CP/M
+	DW	0			;
+	DW	DIRBUF		; Address of 128-byte sector buffer
+	DW	DPBLK		; Address of DPB (Disk parameter block)
+	DW	CHK01		; Address of the directory checksum vector
+	DW	ALL01		; Address fo the allocation vector
+;
+;; Disk parameter (common to all disks)
+;;  - Sharp X1 CP/M 'Language Master' compatible
+DPBLK:
+	DW	64	;SEC PER TRACK
+	DB	4	;BLOCK SHIFT
+	DB	15	;BLOCK MASK
+	DB	1	;EXTNT MASK
+	DW	151	;DISK SIZE-1
+	DW	63	;DIRECTORY MAX
+	DB	80H	;ALLOC0
+	DB	0	;ALLOC1
+	DW	10H	;CHECK SIZE
+	DW	2	;OFFSET
+
+; Check vector
+CHK00:	DS	16		
+CHK01:	DS	16		
+
+; Allocation vector
+ALL00:	DS	31		
+ALL01:	DS	31

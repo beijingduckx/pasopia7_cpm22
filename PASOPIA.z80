@@ -1,0 +1,489 @@
+	TITLE	Pasopia CP/M BIOS
+
+PA7010:
+
+INI_ATTRIB	EQU	00h
+REV_ATTRIB	EQU	80h
+NORM_ATTRIB   	EQU	00h
+
+TITLE_MSG	MACRO
+	DB 	'60K CP/M Version 2.2 for Pasopia'
+		ENDM
+
+COLD_INIT	MACRO
+	ld bc, 80*25
+	ld hl, 0
+	call CLRSTR1
+		ENDM
+
+
+include CMN_BIOS.z80
+
+PPI1A		EQU	08h
+PPI1B		EQU	09h
+PPI1C		EQU	0ah
+PPI1CTRL	EQU	0bh
+
+PPI2A		EQU	00h
+PPI2B		EQU	01h
+PPI2C		EQU	02h
+PPI2CTRL	EQU	03h
+
+
+;; ----------------------------------------
+;; Clear screen from the current cursor
+;;  Input: BC: character count
+;;  interrupt should be disabled
+;; ----------------------------------------
+CLEARSTRING:
+	call CALC_TVRAM
+
+	jr CLRSTR3
+CLRSTR1:	
+	in a,(PPI1B)
+CLRSTR2:
+	; Wait for busy
+	in a,(PPI1B)
+	and 40h
+	jr z, CLRSTR2
+
+	; Setup write data while busy
+
+	; Set addr
+	ld a, h
+	and 7h
+	ld h, a
+	or 40h
+	out (PPI1C), a
+	ld a, l
+	out (PPI2A), a
+	; Set data
+	ld a, ' '
+	out (PPI2B), a
+	; Write
+	ld a, h
+	out (PPI1C), a
+	inc hl
+	dec bc
+CLRSTR3:
+	in a, (PPI1B)
+CLRSTR4:
+	; Wait for writable
+	in a, (PPI1B)
+	and 40h
+	jr nz, CLRSTR4
+
+	ld a, b
+	or c
+	jr nz, CLRSTR1
+
+	; Some delay for write
+	nop
+	nop
+
+	; Write off
+	ld a, h
+	or 40h
+	out (PPI1C), a
+	ret
+
+;; ----------------------------------------
+;; Calcuate VRAM address for current cursor
+;;
+;; Out : HL : VRAM address
+;; ----------------------------------------
+CALC_TVRAM:
+	ld a, (CURY)
+	ld l, a
+	ld h, 0
+	;; 80 = 16 + 64
+	add hl, hl
+	add hl, hl  ; x4
+	add hl, hl  ; x8
+	add hl, hl  ; x16
+	ld d, h
+	ld e, l
+	add hl, hl  ; x32
+	add hl, hl  ; x64
+	add hl, de
+	ex de, hl
+	;; x
+	ld a, (CURX)
+	ld l, a
+	ld h, 0
+	add hl, de
+	ex de, hl
+	ld hl, (VRAM_ORIGIN)
+	add hl, de
+	ld a, h
+	and 7h
+	ld h, a
+	ret
+
+VRAM_ORIGIN:
+	dw	00h
+
+WHOLE_SCROLL:
+	ld hl, (VRAM_ORIGIN)
+	ex de, hl
+	ld hl, 80
+	add hl, de
+	ld a, h
+	and 7h
+	ld h, a
+	ld (VRAM_ORIGIN), hl
+	ld a, 12
+	out (CRTC), a
+	ld a, h
+	out (CRTC+1),a
+	ld a, 13
+	out (CRTC), a
+	ld a, l
+	out (CRTC+1), a
+	ld de, 80*MAXLINE
+	add hl, de
+	ld a, h
+	and 7h
+	ld h, a
+	ld bc, 80
+	call CLRSTR1
+	ret
+
+;; ----------------------------------------
+;; Partial line scroll  (BIOS func #46)
+;; B: 0: scroll-up, 1: scroll-down
+;; D: Top line
+;; E: Bottom line
+;;  - TVRAM should be on
+;; ----------------------------------------
+SCROLL:
+	push hl
+	; Clear attribute
+	ld a, (ATTRIB)
+	push af
+	xor a
+	ld (ATTRIB), a
+	;
+	ld a, e
+	sub d
+	jr c, SCROLL_END
+	jr z, SCROLL_END
+	;; NOTE: no error check
+	push af
+	ld a, b
+	or a
+	jr nz, SCROLL_DOWN
+
+	;; SCROLL UP
+	ld h, 0
+	ld l, d
+	inc l
+	call X80
+	ex de, hl
+	ld hl, (VRAM_ORIGIN)
+SCRUP_LOOP:
+	add hl, de
+	ex de, hl
+	push de
+	ld hl, CONBUF
+	ld b, 80
+	call READ_VRAM
+	pop de
+	push de
+	ld hl, 80
+	ex de, hl
+	or a		; clear carry
+	sbc hl, de
+	ld d, h
+	ld e, l
+	ld hl, CONBUF
+	ld b, 80
+	call WRITE_VRAM
+	pop de
+	pop af
+	dec a
+	jr z, SCROLL_END
+	push af
+	ld hl, 80
+	jr SCRUP_LOOP
+
+SCROLL_DOWN:
+	;; SCROLL DOWN
+	ld h, 0
+	ld l, e
+	dec l
+	call X80
+	ex de, hl
+	ld hl, (VRAM_ORIGIN)
+	add hl, de
+SCRDWN_LOOP:
+	ex de, hl
+	push de
+	ld hl, CONBUF
+	ld b, 80
+	call READ_VRAM
+	pop de
+	push de
+	ld hl, 80
+	ex de, hl
+	add hl, de
+	ld d, h
+	ld e, l
+	ld hl, CONBUF
+	ld b, 80
+	call WRITE_VRAM
+	pop de
+	pop af
+	dec a
+	jr z, SCROLL_END
+	push af
+	ld hl, 80
+	ex de, hl
+	sbc hl, de
+
+	jr SCRDWN_LOOP
+
+SCROLL_END:
+	pop af
+	ld (ATTRIB), a
+	pop hl
+	ret
+
+;; ----------------------------------------
+;; String output
+;;   - c : count
+;;   - IX : pointer to string
+;;  Interrupt should be disabled
+;; ----------------------------------------
+PUTSTRING:
+	call CALC_TVRAM
+	ld a, (CURX)
+	add a, c
+	cp 80
+	jr c, PUTS1
+	sub 80
+	push af
+	ld a, (CURY)
+	inc a
+	cp MAXLINE
+	jr c, PUTS2
+	push af
+	push hl
+	push bc
+	push de
+	call WHOLE_SCROLL
+	pop de
+	pop bc
+	pop hl
+	pop af
+	dec a
+PUTS2:
+	ld (CURY), a
+	pop af
+PUTS1:
+	ld d, h
+	ld e, l
+	ld (CURX), a
+	ld b, c
+	push ix
+	pop hl
+	call WRITE_VRAM
+	call SETCURSOR
+	;ei
+	ret
+
+        ret
+
+; ------------------------------------
+;  HL: Data top
+;  DE: VRAM addr (Text only)
+;   b: Number of data
+; ------------------------------------
+WRITE_VRAM:
+	jr WVRAM3
+WVRAM1:	
+	in a,(PPI1B)
+WVRAM2:
+	; Wait for busy
+	in a,(PPI1B)
+	and 40h
+	jr z, WVRAM2
+
+	; Setup write data while busy
+
+	; Set addr
+	ld a, d
+	and 7h
+	ld d, a
+	or 40h
+	out (PPI1C), a
+	ld a, e
+	out (PPI2A), a
+	; Set data
+	ld c, PPI2B
+	outi
+	; Write
+	ld a, (ATTRIB)
+	or d
+	out (PPI1C), a
+
+	inc de
+WVRAM3:
+	in a,(PPI1B)
+WVRAM4:
+	; Wait for writable
+	in a,(PPI1B)
+	and 40h
+	jr nz, WVRAM4
+
+	ld a, b
+	or a
+	jr nz, WVRAM1
+
+	; Some delay for write
+	nop
+	nop
+
+	; Write off
+	ld a, d
+	or 40h
+	out (PPI1C), a
+	ret
+
+; ------------------------------------
+;  HL: Data top
+;  DE: VRAM addr (Text only)
+;   b: Number of data
+; ------------------------------------
+READ_VRAM:
+	; Wait for busy
+	in a,(PPI1B)
+RVRAM2:
+	in a,(PPI1B)
+	and 40h
+	jr z, RVRAM2
+
+	; Set addr
+	ld a, d
+	and 7h
+	ld d, a
+	or 40h
+	out (PPI1C), a
+	ld a, e
+	out (PPI2A), a
+	; wait for non-busy
+	; dummy read
+	in a,(PPI1B)
+RVRAM1:	
+	in a,(PPI1B)
+	and 40h
+	jr nz, RVRAM1
+	; Read
+	ld c, PPI2C
+	ini
+
+	inc de
+	ld a, b
+	or a
+	jr nz, READ_VRAM
+	ret
+
+;; ----------------------------------------
+;; Update cursor pos(CRTC)
+;; ----------------------------------------
+SETCURSOR:
+	ld a, (CURY)
+	ld l, a
+	ld h, 0
+	call X80
+	ld a, (CURX)
+	ex de, hl
+	ld l, a
+	ld h, 0
+	add hl, de
+	ex de, hl
+	ld hl, (VRAM_ORIGIN)
+	add hl, de
+	ld a, 14
+	out (CRTC), a
+	ld a, h
+	out (CRTC+1), a
+	ld a, 15
+	out (CRTC), a
+	ld a, l
+	out (CRTC+1), a
+	ld h, 7
+	ld a, (KEYSTATE)
+	; CAPS
+	bit 0, a
+	jr z, SETCUR2
+	ld h, 6
+SETCUR2:
+	; KANA
+	bit 1, a
+	jr z, SETCUR3
+	ld h, 0
+SETCUR3:
+	ld a, 10
+	out (CRTC), a
+	ld a, h
+	out (CRTC+1), a
+
+	ret
+
+
+;; -----------------------------------
+;;  Pasopia CRTC Setting
+;;   (from S-OS for Pasopia)
+;; -----------------------------------
+CRTC_DATA:
+	db 70h, 50h, 59h, 38h, 1fh, 02h, 19h, 1ch, 50h
+	db 07, 07, 07, 0, 0, 0, 0
+
+;; -----------------------------------
+;;  Pasopia (Japan model) Key map
+;; -----------------------------------
+
+DEFAULT_MAP:
+	db 00h, 00h, 00h, 00h, 00h, 00h, 00h, 00h
+	db 30h, 31h, 32h, 33h, 34h, 35h, 36h, 37h
+	db 38h, 39h, 2Dh, 1Fh, 1Eh, 0Bh, 2Eh, 0Dh
+	db 1Ch, 1Bh, 08h, 09h, 00h, 00h, 00h, 00h
+	db 00h, 00h, 00h, 03h, 12h, 1Dh, 00h, 20h
+	db 00h, 00h, 00h, 00h, 00h, 00h, 00h, 00h
+
+SHIFT_ALPHA:
+	db 31h, 30h, 34h, 72h, 79h, 5Fh, 5Eh, 5Ch
+	db 32h, 33h, 38h, 74h, 75h, 37h, 40h, 5Bh
+	db 2Dh, 35h, 36h, 66h, 68h, 39h, 3Ah, 5Dh
+	db 71h, 77h, 65h, 67h, 6Ah, 69h, 6Fh, 70h
+	db 61h, 73h, 64h, 76h, 6Eh, 6Bh, 6Ch, 3Bh
+	db 7Ah, 78h, 63h, 62h, 6Dh, 2Ch, 2Eh, 2Fh
+
+SHIFT_KANA:
+	db 21h, 30h, 24h, 52h, 59h, 5Fh, 5Eh, 5Ch
+	db 22h, 23h, 28h, 54h, 55h, 27h, 40h, 7Bh
+	db 3Dh, 25h, 26h, 46h, 48h, 29h, 2Ah, 7Dh
+	db 51h, 57h, 45h, 47h, 4Ah, 49h, 4Fh, 50h
+	db 41h, 53h, 44h, 56h, 4Eh, 4Bh, 4Ch, 2Bh
+	db 5Ah, 58h, 43h, 42h, 4Dh, 3Ch, 3Eh, 3Fh
+
+	db 0C7h, 0A6h, 0A9h, 0BDh, 0DDh, 0DBh, 0CDh, 0B0h
+	db 0CCh, 0A7h, 0ADh, 0B6h, 0C5h, 0ACh, 0DEh, 0A2h
+	db 0CEh, 0AAh, 0ABh, 0CAh, 0B8h, 0AEh, 0B9h, 0A3h
+	db 0C0h, 0C3h, 0A8h, 0B7h, 0CFh, 0C6h, 0D7h, 0BEh
+	db 0C1h, 0C4h, 0BCh, 0CBh, 0D0h, 0C9h, 0D8h, 0DAh
+	db 0AFh, 0BBh, 0BFh, 0BAh, 0D3h, 0A4h, 0A1h, 0A5h
+
+NORM_KANA:
+	db 0D9h, 0DFh, 0D1h, 0C8h, 0D2h, 0DCh, 0B1h, 0B2h
+	db 0B3h, 0B4h, 0B5h, 0D4h, 0D5h, 0D6h, 0C2h
+
+PADDING:
+	ds      (VECTOR_HIGH*256 + 0f0h) - $
+
+	.dephase
+
+include VECTTBL.z80
+
+        END

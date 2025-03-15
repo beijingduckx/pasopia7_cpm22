@@ -1,0 +1,26 @@
+	.phase VECTOR_HIGH * 256 + 0f0h
+;; -------------------------
+;;
+;;  ISRs
+;;
+;; -------------------------
+VECT_CTC0:
+	dw ISR_NOP  	; F0
+VECT_CTC1:
+	dw ISR_NOP	; F2
+VECT_CTC2:
+	dw KEYREP_INT	; F4
+VECT_CTC3:
+	dw INT_CTC3	; F6
+
+	dw ISR_NOP	; F8
+	dw KEYSTB_INT	; FA - PIO-B
+	dw ISR_NOP	; FC
+	db 00h		; FE
+VECT_PERI:
+	dw ISR_NOP	; FF	
+ISR_NOP:
+	ei
+	reti
+
+	.dephase

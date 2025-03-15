@@ -9,11 +9,11 @@ CBIOSTOP    equ 0ea00h
 
     org 00100h
 
-LOADERSIZE  equ 0100h
+LOADERSIZE  equ 0200h
 LOADERTOP   equ 8000h
 LOADERFROM  equ 0d000h
 
-LOADERENT   equ 8020h
+    .phase 8000h
 
     DI
     LD BC, LOADERSIZE     ;; Loader length
@@ -23,99 +23,305 @@ LOADERENT   equ 8020h
 
     JP LOADERENT
 
-    org 00120h
-    .phase LOADERENT
+LOADERENT:
+    ;; load BIOS
+    ld sp, 9000h
+    ld hl, CBIOSTOP
+    call fdd_rw
 
     ;; load CCP & BDOS
-    call LOADER
+    xor a
+    ld hl, fdc_param+1
+    ld (hl), a	; head, US1, US0
+    inc hl
+    ld (hl), 1	; Cylinder
+    inc hl
+    ld (hl), a	; head
+    inc hl
+    ld (hl), 3	; sector
+    inc hl
+    inc hl
+    ld (hl), 16	; EOT
+    inc hl
+    inc hl
+    inc hl
+    ld (hl), 14	; Num sector
+    ld hl, CCPTOP
+    call fdd_rw
 
-    ;; load BIOS
-    ld hl, 0101h
-    ld (STARTSEC), hl
-    ld hl, 010Dh
-    ld (ENDSEC), hl
-    ld hl, CBIOSTOP
-    ld (READADDR), hl
-    call LOADER
-
+    ;
+    ld hl, fdc_param+1
+    ld (hl), 4	; head, US1, US0
+    inc hl
+    ;ld (hl), 1	; Cylinder
+    inc hl
+    ld (hl), 1	; head
+    inc hl
+    ld (hl), 1	; sector
+    inc hl
+    inc hl
+    ld (hl), 8	; EOT
+    inc hl
+    inc hl
+    inc hl
+    ld (hl), 8	; Num sector
+    ld hl, CCPTOP + 14*256
+    call fdd_rw
+    
     JP CBIOSTOP
 
 
-LOADER:
-    ld de, (STARTSEC)
+; -------------------
+;
+; Disk I/O
+;
+; -------------------
 
-LOOP:
-    ld a,(ENDSEC+1)  ;; end track
-    cp d
-    jr z, FINALTRK
-    ;; full track read
-    ld c, 16
-    jr J2
+STATUS_RQM EQU 80h
+STATUS_DIO EQU 40h
+STATUS_NDM EQU 20h
+STATUS_CB EQU 10h
 
-FINALTRK:
-    ;; partial read
-    ld a, (ENDSEC)
-    ld c, a
+MOTOR_ON  EQU 40h
+MOTOR_OFF EQU 00h
 
-J2:
-    ;; calc num sectors
-    ;; e: sector# read from (1-base)
-    ;; c: sector# to
-    inc c
-    ld a, c
-    sub e
-    ld b, a
-    ;; HL = B * 256 (=num bytes to read)
-    ld l, 0
-    ld h, b
-    push hl
-    ld hl, (READADDR)
-    ld b, a  ;; b = num-sectors
-    ;; d: track#
-    ld a, d
-    PUSH AF
+MFM       EQU 40h
 
-    ;; a .. logical track# (0-80 track)
-    ;; e .. sector read from (1-base)
-    ;; b .. num sectors to read
-    ;; hl .. address to write
-    LD C, 00
-    SRL A
-    RR C
-    LD D, A
-    ;LD E, 01
-    LD A, C
-    LD C, 12h
-    PUSH HL
-    ;HL Buffer
-    ;D  Track
-    ;E  Sector
-    ;B  Num Sector
-    ;A  0x80: side	
-    CALL BIOSENT
-    LD C, 13h
-    CALL BIOSENT
-    POP HL
+FDD_RW_READ  EQU 1
+FDD_RW_WRITE EQU 0
 
-    ;; check end of track
-    ld a, (ENDSEC+1)
-    ld b, a
-    POP AF
-    pop de
-    CP b
+TC_ON		EQU 	0e0h
+TC_OFF		EQU 	0e2h
+FDC_STATUS	EQU 	0e4h
+FDC_DATA	EQU	0e5h
+FDC_CONTROL	EQU	0e6h
+
+; -------------------
+;  FDD Read
+;
+; HL : Read data area
+; -------------------
+fdd_rw:
+	push hl
+	; Prepare for R/W
+	;ld a, MOTOR_ON
+	;out (FDC_CONTROL), a
+	call sense_int_status
+	jr c, fdd_other_err
+	call seek
+	;jr c, fdd_other_err
+fdd_rw21:
+	call sense_int_status
+	jr c, fdd_err
+	; check seek end
+	and 20h
+	jr z, fdd_rw21
+fdd_rw3:
+	ld a, 06h or MFM
+	ld c, 9
+	call c_phase
+	;jr c, fdd_other_err
+	; Exec R/W
+	pop hl         ; Read/write buffer
+	ld a, (fdc_param+9) ; Number of sectors
+	ld d, a
+	ld e, 0        ; de = number of read (256bytes/sector)
+	call e_phase
+	call r_phase
+	;jr c, other_error
+	; Check status
+	ld a, (fdc_resp)
+	ld c, a
+	and 0c0h
+	ret z   ; normal end
+	; Error
+wp_err:
+fdd_err:
+fdd_other_err:
+	pop hl
+	ret
+
+
+	; -------------------
+	; SEEK
+	; -------------------
+seek:   
+	ld a, 0Fh
+	ld c, 3
+	call c_phase
+	;ret c
+wait_int:
+	; wait int = 1 (no timeout)
+	in a, (FDC_CONTROL)
+	bit 7, a
+	jr z, wait_int
+	ret
+
+	; -------------------
+	; SENSE INTERRUPT STATUS
+	; -------------------
+sense_int_status:
+	ld a, 08h
+	ld c, 1
+	call c_phase
+	;ret c
+
+	call r_phase
+	;ret c
+
+	ld a, (fdc_resp)
+	cp 80h
+	ld c, a
+	; Invalid is treated as normal
+	jr z, sense_int_normal
+	; Equipment check, Not ready
+	ld c, a
+	and 18h
+	jr nz, not_ready_err
+	; Interrupt Code check
+	ld a, c
+	and 0c0h
+	jr z, sense_int_normal
+other_error:
+	;ld a, 0ffh
+	;scf
+	;jr fdd_set_motor_off
+
+not_ready_err:
+	;ld a, 01h
+	;scf
+	;jr fdd_set_motor_off
+
+sense_int_normal:
+	ld a, c
+	; Normal end
+	ret
+
+recalibrate:
+	;ret
+
+	; -----------------------------
+	; C-PHASE
+	; C : number of parameter
+	; -----------------------------
+c_phase:
+	ld (fdc_param), a
+c_phase2:
+	; wait cb=0
+	in a, (FDC_STATUS)
+	cp 0ffh
+	;jr nz, c_phase1
     ret z
+	; unexpected error
+	; FDC reset needed
+	;scf
+	;ret
+c_phase1:        
+	and status_cb
+	jr nz, c_phase2
+	ld hl, fdc_param
 
-    add hl, de
-    ld (READADDR), hl
+	; send parameters
+wait_rqm:
+	; wait RQM=1, DIO = 0
+	in a, (FDC_STATUS)
+	and (STATUS_RQM or STATUS_DIO)
+	cp STATUS_RQM
+	jr nz, wait_rqm
 
-    ;; next track
-    INC A
-    ld d, a
-    ld e, 1     ;; read from 1sector
-    ;; d : track#
-    ;; e : sector# read from
+	; Write parameter
+	ld a,(hl)
+	out (FDC_DATA), a
+	inc hl
+	dec c
+	jr nz, wait_rqm
+	ret
 
-    jr LOOP
+
+	; -----------------------------
+	; E-PHASE
+	; HL : pointer to data area
+	; DE : number of read/write
+	; -----------------------------
+e_phase:
+	; With wait_int, it greatly hit
+	; access performance on emualtor
+	;call wait_int
+	ld bc, 00e5h
+e_phase1:
+	; Check RQM=1
+	in a, (FDC_STATUS)
+	rlca
+	jr nc, e_phase1
+	; Check DIO
+	rlca 
+	;jr nc, e_phase_write
+	; Check NDM
+	rlca
+	jr nc, e_phase_end
+e_phase_read:
+	ini
+	;jr nz, e_phase1
+	dec de
+	ld a, e
+	or d
+	jr nz, e_phase1
+
+e_phase_end:
+	; TC ON - OFF
+	out (TC_ON), a
+	out (TC_OFF), a
+	ret
+
+	; -----------------------------
+	; R-PHASE
+	; -----------------------------
+r_phase:
+	; With wait_int, it greatly hit
+	; access performance on emualtor
+	;call wait_int
+	ld hl, fdc_resp
+r_phase1:
+	; wait RQM=1, DIO=1
+	in a,(FDC_STATUS)
+	;cp 0ffh
+	;jr nz, r_phase2
+	; unexpeceted error
+	; FDC reset needed
+	;scf
+	;ret
+
+r_phase2:
+	rlca
+	jr nc, r_phase1
+	rlca
+	ret nc
+	in a, (FDC_DATA)
+	ld (hl), a
+	inc hl
+	jr r_phase1
+
+
+	; -------------------
+	; WORK RAM
+	; -------------------
+fdc_param:
+	; FDC parameter (for loading BIOS part)
+	db	00h  ; 0: command
+	db	04h  ; 1: HD, US1, US0
+	db	00h  ; 2: Cylinder
+	db	01h  ; 3: Head
+	db	01h  ; 4: Sector
+	db	01h  ; 5: 256 bytes/sector
+	db	0eh  ; 6: EOT
+	db	0eh  ; 7: GSL
+	db	0ffh ; 8: DTL
+	db	0eh  ; 9: Number of sectors
+	db      00h
+
+fdc_resp:
+	; FDC response
+	ds      7
 
 STARTSEC: dw  0203h   ;;(track:sector)
 ENDSEC:   dw  0308h   
